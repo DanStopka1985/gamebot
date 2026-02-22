@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"database/sql"
 	"fmt"
 	"log"
 	"strconv"
@@ -42,7 +43,19 @@ func (h *MessageHandler) HandleMessage(message *tgbotapi.Message) {
 	utils.RegisterUserIfNotExists(database.DB, message.From)
 
 	// Проверяем, есть ли у пользователя активное состояние
-	if _, exists := h.UserStates[userID]; exists {
+	if state, exists := h.UserStates[userID]; exists {
+		// Для состояний, связанных с вводом имен и количества
+		if state.Action == "entering_names" {
+			// Создаем временный callbackHandler для обработки имен
+			callbackHandler := NewCallbackHandler(h.Bot, h.AdminIDs, h.UserStates)
+			callbackHandler.handleParticipantNames(message)
+			return
+		}
+		if state.Action == "entering_custom_count" {
+			callbackHandler := NewCallbackHandler(h.Bot, h.AdminIDs, h.UserStates)
+			callbackHandler.handleCustomCount(message)
+			return
+		}
 		h.handleUserInput(message)
 		return
 	}
@@ -110,7 +123,7 @@ func (h *MessageHandler) showStats(chatID int64) {
 	// Всего пользователей
 	database.DB.QueryRow(`SELECT COUNT(*) FROM "user"`).Scan(&totalUsers)
 
-	// Всего записей
+	// Всего записей (активных)
 	database.DB.QueryRow(`SELECT COUNT(*) FROM user_event WHERE status = 'registered'`).Scan(&totalRegistrations)
 
 	// Предстоящих событий
@@ -134,7 +147,7 @@ func (h *MessageHandler) showAllRegistrations(chatID int64) {
 	log.Printf("👥 Запрос всех записей от администратора %d", chatID)
 
 	rows, err := database.DB.Query(`
-		SELECT e.id, c.name, e.evn_datetime, u.nikname, u.firstname, u.lastname, ue.participants_count, ue.registered_at
+		SELECT e.id, c.name, e.evn_datetime, u.nikname, u.firstname, u.lastname, ue.participants_count, ue.participants_info, ue.registered_at
 		FROM user_event ue
 		JOIN event e ON ue.event_id = e.id
 		JOIN category c ON e.category_id = c.id
@@ -160,8 +173,9 @@ func (h *MessageHandler) showAllRegistrations(chatID int64) {
 		var categoryName, nikname, first, last string
 		var eventDate, regDate time.Time
 		var participants int
+		var participantsInfo sql.NullString
 
-		err := rows.Scan(&eventID, &categoryName, &eventDate, &nikname, &first, &last, &participants, &regDate)
+		err := rows.Scan(&eventID, &categoryName, &eventDate, &nikname, &first, &last, &participants, &participantsInfo, &regDate)
 		if err != nil {
 			log.Printf("❌ Ошибка сканирования: %v", err)
 			continue
@@ -175,6 +189,9 @@ func (h *MessageHandler) showAllRegistrations(chatID int64) {
 		text += fmt.Sprintf("*Событие #%d:* %s\n", eventID, categoryName)
 		text += fmt.Sprintf("📆 %s\n", eventDate.Format("02.01.2006 15:04"))
 		text += fmt.Sprintf("👤 %s - %d чел.\n", userName, participants)
+		if participantsInfo.Valid && participantsInfo.String != "" && participantsInfo.String != fmt.Sprintf("%d человек", participants) {
+			text += fmt.Sprintf("   📋 %s\n", participantsInfo.String)
+		}
 		text += fmt.Sprintf("📅 Запись: %s\n\n", regDate.Format("02.01.2006 15:04"))
 	}
 
@@ -314,7 +331,7 @@ func (h *MessageHandler) handleMyEvents(message *tgbotapi.Message) {
 	}
 
 	rows, err := database.DB.Query(`
-		SELECT e.id, c.name, e.evn_datetime, ue.participants_count
+		SELECT e.id, c.name, e.evn_datetime, ue.participants_count, ue.participants_info
 		FROM user_event ue
 		JOIN event e ON ue.event_id = e.id
 		JOIN category c ON e.category_id = c.id
@@ -336,7 +353,8 @@ func (h *MessageHandler) handleMyEvents(message *tgbotapi.Message) {
 		var name string
 		var dt time.Time
 		var participants int
-		err := rows.Scan(&id, &name, &dt, &participants)
+		var participantsInfo sql.NullString
+		err := rows.Scan(&id, &name, &dt, &participants, &participantsInfo)
 		if err != nil {
 			log.Printf("❌ Ошибка сканирования: %v", err)
 			continue
@@ -346,6 +364,10 @@ func (h *MessageHandler) handleMyEvents(message *tgbotapi.Message) {
 			"📅 *%s*\n📆 %s\n👥 Записано: %d\n",
 			name, dt.Format("02.01.2006 15:04"), participants,
 		)
+
+		if participantsInfo.Valid && participantsInfo.String != "" && participantsInfo.String != fmt.Sprintf("%d человек", participants) {
+			text += fmt.Sprintf("📋 Участники: %s\n", participantsInfo.String)
+		}
 
 		keyboard := tgbotapi.NewInlineKeyboardMarkup(
 			tgbotapi.NewInlineKeyboardRow(
@@ -670,7 +692,7 @@ func (h *MessageHandler) showEventStats(chatID int64, eventIDStr string) {
 	log.Printf("📊 Запрос статистики по событию %d от администратора %d", eventID, chatID)
 
 	rows, err := database.DB.Query(`
-		SELECT u.nikname, u.firstname, u.lastname, ue.participants_count, ue.registered_at
+		SELECT u.nikname, u.firstname, u.lastname, ue.participants_count, ue.participants_info, ue.registered_at
 		FROM user_event ue
 		JOIN "user" u ON ue.user_id = u.id
 		WHERE ue.event_id = $1 AND ue.status = 'registered'
@@ -691,17 +713,25 @@ func (h *MessageHandler) showEventStats(chatID int64, eventIDStr string) {
 		count++
 		var nikname, first, last string
 		var participants int
+		var participantsInfo sql.NullString
 		var regTime time.Time
-		err := rows.Scan(&nikname, &first, &last, &participants, &regTime)
+		err := rows.Scan(&nikname, &first, &last, &participants, &participantsInfo, &regTime)
 		if err != nil {
 			log.Printf("❌ Ошибка сканирования: %v", err)
 			continue
 		}
 		totalParticipants += participants
 
-		text += fmt.Sprintf("%d. @%s (%s %s) - %d чел.\n   📅 %s\n",
-			count, nikname, first, last, participants,
-			regTime.Format("02.01 15:04"))
+		userName := nikname
+		if first != "" {
+			userName = first + " " + last
+		}
+
+		text += fmt.Sprintf("%d. @%s - %d чел.\n", count, userName, participants)
+		if participantsInfo.Valid && participantsInfo.String != "" && participantsInfo.String != fmt.Sprintf("%d человек", participants) {
+			text += fmt.Sprintf("   📋 %s\n", participantsInfo.String)
+		}
+		text += fmt.Sprintf("   📅 %s\n\n", regTime.Format("02.01 15:04"))
 	}
 
 	if count == 0 {
