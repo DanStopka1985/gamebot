@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
 // Pluralize возвращает правильную форму слова в зависимости от числа
@@ -19,10 +19,10 @@ func Pluralize(n int, form1, form2, form5 string) string {
 	return form5
 }
 
-// RegisterUserIfNotExists регистрирует пользователя, если его нет в БД
-func RegisterUserIfNotExists(db *sql.DB, tgUser *tgbotapi.User) {
+// RegisterPersonIfNotExists регистрирует человека, если его нет в БД
+func RegisterPersonIfNotExists(db *sql.DB, tgUser *tgbotapi.User) {
 	var exists bool
-	err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM "user" WHERE telegram_id = $1)`,
+	err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM person WHERE telegram_id = $1)`,
 		tgUser.ID).Scan(&exists)
 
 	if err != nil || exists {
@@ -35,7 +35,7 @@ func RegisterUserIfNotExists(db *sql.DB, tgUser *tgbotapi.User) {
 	}
 
 	_, err = db.Exec(`
-		INSERT INTO "user" (telegram_id, nikname, firstname, lastname)
+		INSERT INTO person (telegram_id, nikname, firstname, lastname)
 		VALUES ($1, $2, $3, $4)
 	`, tgUser.ID, nikname, tgUser.FirstName, tgUser.LastName)
 
@@ -46,5 +46,6 @@ func RegisterUserIfNotExists(db *sql.DB, tgUser *tgbotapi.User) {
 
 // IsAdmin проверяет, является ли пользователь администратором
 func IsAdmin(adminIDs map[int64]bool, userID int64) bool {
-	return adminIDs[userID]
+	_, exists := adminIDs[userID]
+	return exists
 }

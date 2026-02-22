@@ -12,8 +12,8 @@ type Event struct {
 	Registered   int
 }
 
-// User структура для пользователя
-type User struct {
+// Person структура для пользователя
+type Person struct {
 	ID         int
 	TelegramID int64
 	Nikname    string
@@ -21,12 +21,15 @@ type User struct {
 	LastName   string
 }
 
-// Registration структура для записи
-type Registration struct {
-	UserID            int
+// PersonEvent структура для записи
+type PersonEvent struct {
+	ID                int
+	PersonID          int
 	EventID           int
 	ParticipantsCount int
 	Status            string
+	ParticipantsInfo  string
+	RegisteredAt      time.Time
 }
 
 // UserState структура для хранения состояния пользователя
