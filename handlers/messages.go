@@ -47,9 +47,18 @@ func (h *MessageHandler) HandleMessage(message *tgbotapi.Message) {
 	if state, exists := h.UserStates[userID]; exists {
 		// Для состояний, связанных с вводом имен и количества
 		if state.Action == "entering_names" {
-			callbackHandler := NewCallbackHandler(h.Bot, h.AdminIDs, h.UserStates)
-			callbackHandler.handleParticipantNames(message)
-			return
+			// Проверяем, на каком мы шаге
+			if state.Step == "awaiting_names" {
+				// Только что ввели имена - начинаем поиск
+				callbackHandler := NewCallbackHandler(h.Bot, h.AdminIDs, h.UserStates)
+				callbackHandler.handleParticipantNamesWithSearch(message)
+				return
+			} else if state.Step == "manual_input" {
+				// Вводим данные вручную
+				callbackHandler := NewCallbackHandler(h.Bot, h.AdminIDs, h.UserStates)
+				callbackHandler.handleManualInput(message)
+				return
+			}
 		}
 		if state.Action == "entering_custom_count" {
 			callbackHandler := NewCallbackHandler(h.Bot, h.AdminIDs, h.UserStates)
