@@ -18,17 +18,26 @@ import (
 // CallbackHandler обработчик callback запросов
 type CallbackHandler struct {
 	Bot        *tgbotapi.BotAPI
-	AdminIDs   map[int64]bool
+	AdminIDs   *map[int64]bool
 	UserStates map[int64]*models.UserState
 }
 
 // NewCallbackHandler создает новый обработчик callback'ов
-func NewCallbackHandler(bot *tgbotapi.BotAPI, adminIDs map[int64]bool, userStates map[int64]*models.UserState) *CallbackHandler {
+func NewCallbackHandler(bot *tgbotapi.BotAPI, adminIDs *map[int64]bool, userStates map[int64]*models.UserState) *CallbackHandler {
 	return &CallbackHandler{
 		Bot:        bot,
 		AdminIDs:   adminIDs,
 		UserStates: userStates,
 	}
+}
+
+// isAdmin проверяет, является ли пользователь администратором
+func (h *CallbackHandler) isAdmin(userID int64) bool {
+	if h.AdminIDs == nil {
+		return false
+	}
+	_, exists := (*h.AdminIDs)[userID]
+	return exists
 }
 
 // HandleCallback обрабатывает callback запросы
@@ -149,7 +158,7 @@ func (h *CallbackHandler) HandleCallback(callback *tgbotapi.CallbackQuery) {
 		if len(data) < 2 {
 			return
 		}
-		if utils.IsAdmin(h.AdminIDs, userID) {
+		if h.isAdmin(userID) {
 			h.handleAdminCallback(callback, data)
 		} else {
 			h.Bot.Send(tgbotapi.NewMessage(chatID, "⛔ У вас нет прав администратора"))
@@ -698,6 +707,10 @@ func (h *CallbackHandler) showEventDetails(chatID int64, eventID int, userID int
 func (h *CallbackHandler) handleAdminCallback(callback *tgbotapi.CallbackQuery, data []string) {
 	chatID := callback.Message.Chat.ID
 	userID := callback.From.ID
+
+	if !h.isAdmin(userID) {
+		return
+	}
 
 	if len(data) < 2 {
 		return

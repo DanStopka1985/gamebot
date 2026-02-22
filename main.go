@@ -15,10 +15,11 @@ import (
 )
 
 var (
-	bot           *tgbotapi.BotAPI
-	channelChatID int64
-	adminIDs      = make(map[int64]bool)
-	userStates    = make(map[int64]*models.UserState)
+	bot             *tgbotapi.BotAPI
+	channelChatID   int64
+	adminIDs        = make(map[int64]bool)
+	userStates      = make(map[int64]*models.UserState)
+	lastAdminUpdate time.Time
 )
 
 func main() {
@@ -74,22 +75,13 @@ func main() {
 	}
 	defer database.CloseDB()
 
-	// Загрузка администраторов - ЗАМЕНИТЕ 123456789 НА ВАШ РЕАЛЬНЫЙ ID
-	// Ваш ID из логов: 97158544
-	adminIDs[97158544] = true // Исправлено: добавлен ваш реальный ID
+	// Загружаем администраторов канала (вместо жестко прописанных)
+	updateAdminList()
 
-	log.Printf("👑 Загружено %d администраторов", len(adminIDs))
-	log.Printf("ℹ️ Ваш ID администратора: 97158544")
-
-	// Выводим список админов для проверки
-	for id := range adminIDs {
-		log.Printf("   - Админ ID: %d", id)
-	}
-
-	// Создаем обработчики
+	// Создаем обработчики - передаем указатель на adminIDs
 	channelHandler := handlers.NewChannelHandler(bot)
-	msgHandler := handlers.NewMessageHandler(bot, adminIDs, userStates)
-	callbackHandler := handlers.NewCallbackHandler(bot, adminIDs, userStates)
+	msgHandler := handlers.NewMessageHandler(bot, &adminIDs, userStates)
+	callbackHandler := handlers.NewCallbackHandler(bot, &adminIDs, userStates)
 
 	// Проверка создания обработчиков
 	log.Println("✅ Обработчики созданы:")
@@ -118,7 +110,7 @@ func main() {
 	// Настройка обновлений с правильными параметрами
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
-	u.AllowedUpdates = []string{"message", "callback_query", "channel_post"} // Разрешаем все типы обновлений
+	u.AllowedUpdates = []string{"message", "callback_query", "channel_post", "my_chat_member", "chat_member"}
 
 	log.Println("🔄 Получаем обновления...")
 	updates := bot.GetUpdatesChan(u)
@@ -128,8 +120,22 @@ func main() {
 	log.Println("🚀 Бот запущен и слушает обновления")
 	log.Println("📝 Для остановки нажмите Ctrl+C")
 
+	// Запускаем горутину для периодического обновления списка админов (каждый час)
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		for range ticker.C {
+			updateAdminList()
+		}
+	}()
+
 	// Обрабатываем обновления
 	for update := range updates {
+		// Обновляем список админов при изменении в чате
+		if update.MyChatMember != nil || update.ChatMember != nil {
+			log.Println("🔄 Обновление списка администраторов (изменение в чате)")
+			updateAdminList()
+		}
+
 		// Новые посты в канале - добавляем кнопку
 		if update.ChannelPost != nil {
 			log.Printf("📨 Получен новый пост в канале: ID=%d, текст=%s",
@@ -164,18 +170,33 @@ func main() {
 				update.Message.Text)
 			msgHandler.HandleMessage(update.Message)
 		}
-
-		// Добавим обработку всех типов обновлений для отладки
-		if update.MyChatMember != nil {
-			log.Printf("👤 Изменение в чате: %v", update.MyChatMember)
-		}
-		if update.ChatMember != nil {
-			log.Printf("👥 Изменение участника чата: %v", update.ChatMember)
-		}
-		if update.ChatJoinRequest != nil {
-			log.Printf("🚪 Запрос на вступление: %v", update.ChatJoinRequest)
-		}
 	}
 }
 
-// Загрузка администраторов - функция больше не нужна, все в main
+// updateAdminList обновляет список администраторов канала
+func updateAdminList() {
+	log.Println("🔄 Обновление списка администраторов канала...")
+
+	admins, err := bot.GetChatAdministrators(tgbotapi.ChatAdministratorsConfig{
+		ChatConfig: tgbotapi.ChatConfig{
+			ChatID: channelChatID,
+		},
+	})
+
+	if err != nil {
+		log.Printf("❌ Ошибка получения списка администраторов: %v", err)
+		return
+	}
+
+	// Очищаем старый список
+	adminIDs = make(map[int64]bool)
+
+	// Добавляем всех администраторов
+	for _, admin := range admins {
+		adminIDs[admin.User.ID] = true
+		log.Printf("   👑 Админ: @%s (ID: %d)", admin.User.UserName, admin.User.ID)
+	}
+
+	log.Printf("✅ Загружено %d администраторов канала", len(adminIDs))
+	lastAdminUpdate = time.Now()
+}

@@ -17,12 +17,12 @@ import (
 // MessageHandler обработчик текстовых сообщений
 type MessageHandler struct {
 	Bot        *tgbotapi.BotAPI
-	AdminIDs   map[int64]bool
+	AdminIDs   *map[int64]bool
 	UserStates map[int64]*models.UserState
 }
 
 // NewMessageHandler создает новый обработчик сообщений
-func NewMessageHandler(bot *tgbotapi.BotAPI, adminIDs map[int64]bool, userStates map[int64]*models.UserState) *MessageHandler {
+func NewMessageHandler(bot *tgbotapi.BotAPI, adminIDs *map[int64]bool, userStates map[int64]*models.UserState) *MessageHandler {
 	return &MessageHandler{
 		Bot:        bot,
 		AdminIDs:   adminIDs,
@@ -46,12 +46,13 @@ func (h *MessageHandler) HandleMessage(message *tgbotapi.Message) {
 	if state, exists := h.UserStates[userID]; exists {
 		// Для состояний, связанных с вводом имен и количества
 		if state.Action == "entering_names" {
-			// Создаем временный callbackHandler для обработки имен
+			// Передаем указатель напрямую
 			callbackHandler := NewCallbackHandler(h.Bot, h.AdminIDs, h.UserStates)
 			callbackHandler.handleParticipantNames(message)
 			return
 		}
 		if state.Action == "entering_custom_count" {
+			// Передаем указатель напрямую
 			callbackHandler := NewCallbackHandler(h.Bot, h.AdminIDs, h.UserStates)
 			callbackHandler.handleCustomCount(message)
 			return
@@ -63,7 +64,7 @@ func (h *MessageHandler) HandleMessage(message *tgbotapi.Message) {
 	// Обработка обычных текстовых сообщений (не команд)
 	if !message.IsCommand() {
 		// Проверяем, является ли пользователь админом
-		if utils.IsAdmin(h.AdminIDs, userID) {
+		if h.isAdmin(userID) {
 			h.handleAdminText(message)
 		}
 		return
@@ -79,7 +80,7 @@ func (h *MessageHandler) HandleMessage(message *tgbotapi.Message) {
 		case "myevents":
 			h.handleMyEvents(message)
 		default:
-			if utils.IsAdmin(h.AdminIDs, userID) {
+			if h.isAdmin(userID) {
 				h.handleAdminCommand(message)
 			}
 		}
@@ -87,11 +88,24 @@ func (h *MessageHandler) HandleMessage(message *tgbotapi.Message) {
 	}
 }
 
+// isAdmin проверяет, является ли пользователь администратором
+func (h *MessageHandler) isAdmin(userID int64) bool {
+	if h.AdminIDs == nil {
+		return false
+	}
+	_, exists := (*h.AdminIDs)[userID]
+	return exists
+}
+
 // handleAdminText обрабатывает текстовые кнопки админ-меню
 func (h *MessageHandler) handleAdminText(message *tgbotapi.Message) {
 	text := message.Text
 	chatID := message.Chat.ID
 	userID := message.From.ID
+
+	if !h.isAdmin(userID) {
+		return
+	}
 
 	log.Printf("👑 Админское текстовое сообщение: %s от %d", text, userID)
 
@@ -105,13 +119,16 @@ func (h *MessageHandler) handleAdminText(message *tgbotapi.Message) {
 	case "👥 Все записи":
 		h.showAllRegistrations(chatID)
 	default:
-		// Если текст не совпадает с кнопками, ничего не делаем
 		log.Printf("❓ Неизвестная админская команда: %s", text)
 	}
 }
 
 // showStats показывает общую статистику
 func (h *MessageHandler) showStats(chatID int64) {
+	if !h.isAdmin(chatID) {
+		return
+	}
+
 	log.Printf("📊 Запрос статистики от администратора %d", chatID)
 
 	var totalEvents, totalUsers, totalRegistrations int
@@ -144,6 +161,10 @@ func (h *MessageHandler) showStats(chatID int64) {
 
 // showAllRegistrations показывает все записи
 func (h *MessageHandler) showAllRegistrations(chatID int64) {
+	if !h.isAdmin(chatID) {
+		return
+	}
+
 	log.Printf("👥 Запрос всех записей от администратора %d", chatID)
 
 	rows, err := database.DB.Query(`
@@ -580,7 +601,7 @@ func (h *MessageHandler) handleEditEventInput(message *tgbotapi.Message, state *
 
 // startAddEvent начинает процесс добавления события
 func (h *MessageHandler) startAddEvent(message *tgbotapi.Message) {
-	if !utils.IsAdmin(h.AdminIDs, message.From.ID) {
+	if !h.isAdmin(message.From.ID) {
 		h.Bot.Send(tgbotapi.NewMessage(message.Chat.ID, "⛔ Нет прав"))
 		return
 	}
@@ -618,7 +639,7 @@ func (h *MessageHandler) startAddEvent(message *tgbotapi.Message) {
 
 // showAllEvents показывает все события для администратора
 func (h *MessageHandler) showAllEvents(chatID int64) {
-	if !utils.IsAdmin(h.AdminIDs, chatID) {
+	if !h.isAdmin(chatID) {
 		return
 	}
 
@@ -679,7 +700,7 @@ func (h *MessageHandler) showAllEvents(chatID int64) {
 
 // showEventStats показывает статистику по событию
 func (h *MessageHandler) showEventStats(chatID int64, eventIDStr string) {
-	if !utils.IsAdmin(h.AdminIDs, chatID) {
+	if !h.isAdmin(chatID) {
 		return
 	}
 
