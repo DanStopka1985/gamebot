@@ -798,6 +798,23 @@ func (h *CallbackHandler) handleAdminCallback(callback *tgbotapi.CallbackQuery, 
 		eventID, _ := strconv.Atoi(data[2])
 		h.showEventRegistrations(chatID, eventID)
 
+	case "view_event_registrations":
+		if len(data) < 3 {
+			return
+		}
+		eventID, _ := strconv.Atoi(data[2])
+		// Создаем временный messageHandler для вызова функции
+		msgHandler := NewMessageHandler(h.Bot, h.AdminIDs, h.UserStates)
+		msgHandler.showEventRegistrations(chatID, eventID)
+
+	case "view_all_registrations":
+		msgHandler := NewMessageHandler(h.Bot, h.AdminIDs, h.UserStates)
+		msgHandler.showAllRegistrationsFull(chatID)
+
+	case "back_to_events":
+		msgHandler := NewMessageHandler(h.Bot, h.AdminIDs, h.UserStates)
+		msgHandler.showAllRegistrations(chatID)
+
 	case "back":
 		delete(h.UserStates, userID)
 		// Показываем админское меню
