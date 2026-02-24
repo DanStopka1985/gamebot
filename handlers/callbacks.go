@@ -101,6 +101,34 @@ func (h *CallbackHandler) HandleCallback(callback *tgbotapi.CallbackQuery) {
 		return
 	}
 
+	// Проверяем, не является ли это админским callback'ом с точкой
+	if data[0] == "admin" {
+		if h.isAdmin(userID) {
+			h.handleAdminCallback(callback, data)
+		} else {
+			h.Bot.Send(tgbotapi.NewMessage(chatID, "⛔ У вас нет прав администратора"))
+		}
+		return
+	}
+
+	// Проверяем специальные команды, которые могут приходить без префикса admin
+	switch data[0] {
+	case "players_page":
+		if len(data) < 3 {
+			return
+		}
+		page, _ := strconv.Atoi(data[1])
+		filter := data[2]
+		if h.isAdmin(userID) {
+			msgHandler := NewMessageHandler(h.Bot, h.AdminIDs, h.UserStates)
+			msgHandler.showPlayersList(chatID, page, filter)
+		} else {
+			h.Bot.Send(tgbotapi.NewMessage(chatID, "⛔ У вас нет прав администратора"))
+		}
+		return
+	}
+
+	// Обычные callback'и для пользователей
 	switch data[0] {
 	case "register":
 		if len(data) < 2 {
@@ -179,16 +207,6 @@ func (h *CallbackHandler) HandleCallback(callback *tgbotapi.CallbackQuery) {
 		}
 		eventID, _ := strconv.Atoi(data[1])
 		h.showEventDetails(chatID, eventID, userID)
-
-	case "admin":
-		if len(data) < 2 {
-			return
-		}
-		if h.isAdmin(userID) {
-			h.handleAdminCallback(callback, data)
-		} else {
-			h.Bot.Send(tgbotapi.NewMessage(chatID, "⛔ У вас нет прав администратора"))
-		}
 
 	default:
 		log.Printf("❌ Неизвестная команда: %s", data[0])
@@ -1218,6 +1236,87 @@ func (h *CallbackHandler) handleAdminCallback(callback *tgbotapi.CallbackQuery, 
 		msgHandler := NewMessageHandler(h.Bot, h.AdminIDs, h.UserStates)
 		msgHandler.showAllRegistrations(chatID)
 
+	// НОВЫЕ CASE ДЛЯ УПРАВЛЕНИЯ ИГРОКАМИ
+	case "players_menu":
+		msgHandler := NewMessageHandler(h.Bot, h.AdminIDs, h.UserStates)
+		msgHandler.showPlayersMenu(chatID)
+
+	case "players_page":
+		if len(data) < 3 {
+			return
+		}
+		page, _ := strconv.Atoi(data[1])
+		filter := data[2]
+		if h.isAdmin(userID) {
+			msgHandler := NewMessageHandler(h.Bot, h.AdminIDs, h.UserStates)
+			msgHandler.showPlayersList(chatID, page, filter)
+		} else {
+			h.Bot.Send(tgbotapi.NewMessage(chatID, "⛔ У вас нет прав администратора"))
+		}
+		return
+
+	case "view_player":
+		if len(data) < 3 {
+			return
+		}
+		playerID, _ := strconv.Atoi(data[2])
+		msgHandler := NewMessageHandler(h.Bot, h.AdminIDs, h.UserStates)
+		msgHandler.showPlayerDetails(chatID, playerID)
+
+	case "edit_player":
+		if len(data) < 3 {
+			return
+		}
+		playerID, _ := strconv.Atoi(data[2])
+		msgHandler := NewMessageHandler(h.Bot, h.AdminIDs, h.UserStates)
+		msgHandler.startEditPlayer(chatID, userID, playerID)
+
+	case "ban_player":
+		if len(data) < 3 {
+			return
+		}
+		playerID, _ := strconv.Atoi(data[2])
+		msgHandler := NewMessageHandler(h.Bot, h.AdminIDs, h.UserStates)
+		msgHandler.banPlayer(chatID, playerID)
+
+	case "unban_player":
+		if len(data) < 3 {
+			return
+		}
+		playerID, _ := strconv.Atoi(data[2])
+		msgHandler := NewMessageHandler(h.Bot, h.AdminIDs, h.UserStates)
+		msgHandler.unbanPlayer(chatID, playerID)
+
+	case "player_history":
+		if len(data) < 3 {
+			return
+		}
+		playerID, _ := strconv.Atoi(data[2])
+		msgHandler := NewMessageHandler(h.Bot, h.AdminIDs, h.UserStates)
+		msgHandler.showPlayerHistory(chatID, playerID)
+
+	case "add_player":
+		msgHandler := NewMessageHandler(h.Bot, h.AdminIDs, h.UserStates)
+		msgHandler.startAddPlayer(&tgbotapi.Message{
+			Chat: &tgbotapi.Chat{ID: chatID},
+			From: &tgbotapi.User{ID: userID},
+		})
+
+	case "search_player":
+		msgHandler := NewMessageHandler(h.Bot, h.AdminIDs, h.UserStates)
+		msgHandler.searchPlayer(&tgbotapi.Message{
+			Chat: &tgbotapi.Chat{ID: chatID},
+			From: &tgbotapi.User{ID: userID},
+		})
+
+	case "back_to_players_list":
+		msgHandler := NewMessageHandler(h.Bot, h.AdminIDs, h.UserStates)
+		msgHandler.showPlayersList(chatID, 1, "")
+
+	case "back_to_players_menu":
+		msgHandler := NewMessageHandler(h.Bot, h.AdminIDs, h.UserStates)
+		msgHandler.showPlayersMenu(chatID)
+
 	case "back":
 		delete(h.UserStates, userID)
 		msg := tgbotapi.NewMessage(chatID, "👑 Панель администратора:")
@@ -1240,6 +1339,9 @@ func (h *CallbackHandler) getAdminKeyboard() tgbotapi.ReplyKeyboardMarkup {
 		tgbotapi.NewKeyboardButtonRow(
 			tgbotapi.NewKeyboardButton("📁 Управление категориями"),
 			tgbotapi.NewKeyboardButton("➕ Добавить категорию"),
+		),
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("👥 Управление игроками"),
 		),
 	)
 	keyboard.ResizeKeyboard = true
