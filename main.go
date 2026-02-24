@@ -75,10 +75,10 @@ func main() {
 	}
 	defer database.CloseDB()
 
-	// Загружаем администраторов канала (вместо жестко прописанных)
+	// Загружаем администраторов канала
 	updateAdminList()
 
-	// Создаем обработчики - передаем указатель на adminIDs
+	// Создаем обработчики
 	channelHandler := handlers.NewChannelHandler(bot)
 	msgHandler := handlers.NewMessageHandler(bot, &adminIDs, userStates)
 	callbackHandler := handlers.NewCallbackHandler(bot, &adminIDs, userStates)
@@ -107,7 +107,7 @@ func main() {
 		log.Println("✅ Webhook не обнаружен, используем long polling")
 	}
 
-	// Настройка обновлений с правильными параметрами
+	// Настройка обновлений
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 	u.AllowedUpdates = []string{"message", "callback_query", "channel_post", "my_chat_member", "chat_member"}

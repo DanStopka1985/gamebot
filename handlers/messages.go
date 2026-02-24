@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strconv"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/lib/pq"
 
 	"gamebot/database"
 	"gamebot/models"
@@ -483,6 +485,7 @@ func (h *MessageHandler) handleAddEventInput(message *tgbotapi.Message, state *m
 		limit, err := strconv.Atoi(text)
 		if err != nil || limit < 1 {
 			h.Bot.Send(tgbotapi.NewMessage(chatID,
+
 				"❌ Введите положительное число:"))
 			return
 		}
@@ -717,7 +720,7 @@ func (h *MessageHandler) showAllRegistrations(chatID int64) {
 	h.Bot.Send(msg)
 }
 
-// showEventRegistrations показывает записи конкретного события
+// showEventRegistrations показывает записи конкретного события с идентификацией
 func (h *MessageHandler) showEventRegistrations(chatID int64, eventID int) {
 	if !h.isAdmin(chatID) {
 		return
@@ -750,6 +753,8 @@ func (h *MessageHandler) showEventRegistrations(chatID int64, eventID int) {
 			p.lastname,
 			pe.participants_count,
 			pe.participants_info,
+			pe.player_ids,
+			pe.identification_data,
 			pe.registered_at
 		FROM person_event pe
 		JOIN person p ON pe.person_id = p.id
@@ -767,6 +772,7 @@ func (h *MessageHandler) showEventRegistrations(chatID int64, eventID int) {
 	var allEntries []string
 	totalParticipants := 0
 	totalRegistrations := 0
+	totalIdentified := 0
 
 	for rows.Next() {
 		totalRegistrations++
@@ -775,15 +781,18 @@ func (h *MessageHandler) showEventRegistrations(chatID int64, eventID int) {
 		var nikname, firstname, lastname string
 		var participants int
 		var participantsInfo sql.NullString
+		var playerIDs []int64
+		var identificationData []byte
 		var regDate time.Time
 
 		err := rows.Scan(&personID, &nikname, &firstname, &lastname,
-			&participants, &participantsInfo, &regDate)
+			&participants, &participantsInfo, pq.Array(&playerIDs), &identificationData, &regDate)
 		if err != nil {
 			log.Printf("❌ Ошибка сканирования: %v", err)
 			continue
 		}
 
+		// Формируем информацию о записавшем
 		registrantInfo := ""
 		if nikname != "" {
 			registrantInfo += "@" + nikname
@@ -798,56 +807,57 @@ func (h *MessageHandler) showEventRegistrations(chatID int64, eventID int) {
 			registrantInfo = fmt.Sprintf("ID: %d", personID)
 		}
 
-		if participantsInfo.Valid && participantsInfo.String != "" &&
-			participantsInfo.String != fmt.Sprintf("%d человек", participants) {
-			cleanInfo := strings.ToValidUTF8(participantsInfo.String, "?")
-			participantNames := strings.Split(cleanInfo, ", ")
-			for _, name := range participantNames {
-				totalParticipants++
+		// Заголовок записи
+		entry := fmt.Sprintf(
+			"👤 *Записал:* %s\n"+
+				"📅 *Дата записи:* %s\n"+
+				"📊 *Участники (%d чел.):*\n",
+			registrantInfo,
+			regDate.Format("02.01.2006 15:04"),
+			participants)
 
-				cleanName := strings.ToValidUTF8(strings.TrimSpace(name), "?")
-
-				participantDisplay := ""
-				if strings.HasPrefix(cleanName, "@") {
-					participantDisplay = "📱 " + cleanName
-				} else {
-					participantDisplay = "👤 " + cleanName
+		// Парсим данные об идентифицированных игроках
+		if len(identificationData) > 0 {
+			var identified []map[string]interface{}
+			if err := json.Unmarshal(identificationData, &identified); err == nil {
+				for i, id := range identified {
+					totalParticipants++
+					if pid, ok := id["player_id"].(float64); ok && pid > 0 {
+						totalIdentified++
+						entry += fmt.Sprintf("   %d. ✅ *%s* (ID: %.0f)\n",
+							i+1, id["full_name"], pid)
+					} else {
+						entry += fmt.Sprintf("   %d. ⚠️ *%s* (не в базе)\n",
+							i+1, id["full_name"])
+					}
 				}
-
-				entry := fmt.Sprintf(
-					"👤 *Записал:* %s\n"+
-						"   🧑 *Участник:* %s\n"+
-						"   📅 *Запись создана:* %s\n"+
-						"   ──────────────────────────\n",
-					registrantInfo,
-					participantDisplay,
-					regDate.Format("02.01.2006 15:04"))
-
-				cleanEntry := strings.ToValidUTF8(entry, "?")
-				allEntries = append(allEntries, cleanEntry)
+			} else {
+				// Если не смогли распарсить JSON, показываем обычную информацию
+				if participantsInfo.Valid {
+					names := strings.Split(participantsInfo.String, ", ")
+					for i, name := range names {
+						totalParticipants++
+						entry += fmt.Sprintf("   %d. %s\n", i+1, name)
+					}
+				}
 			}
-		} else {
-			for i := 1; i <= participants; i++ {
+		} else if participantsInfo.Valid {
+			names := strings.Split(participantsInfo.String, ", ")
+			for i, name := range names {
 				totalParticipants++
-				entry := fmt.Sprintf(
-					"👤 *Записал:* %s\n"+
-						"   🧑 *Участник #%d* (имя не указано)\n"+
-						"   📅 *Запись создана:* %s\n"+
-						"   ──────────────────────────\n",
-					registrantInfo,
-					i,
-					regDate.Format("02.01.2006 15:04"))
-
-				cleanEntry := strings.ToValidUTF8(entry, "?")
-				allEntries = append(allEntries, cleanEntry)
+				entry += fmt.Sprintf("   %d. %s\n", i+1, name)
 			}
 		}
+
+		entry += "   ──────────────────────────\n"
+		allEntries = append(allEntries, entry)
 	}
 
 	header := fmt.Sprintf("📊 *Событие: %s*\n", eventInfo.CategoryName)
 	header += fmt.Sprintf("📆 *Дата:* %s\n", eventInfo.DateTime.Format("02.01.2006 15:04"))
 	header += fmt.Sprintf("📝 *Всего записей:* %d\n", totalRegistrations)
 	header += fmt.Sprintf("👥 *Всего участников:* %d\n", totalParticipants)
+	header += fmt.Sprintf("✅ *Идентифицировано:* %d\n", totalIdentified)
 	header += "════════════════════════════════════════\n\n"
 
 	cleanHeader := strings.ToValidUTF8(header, "?")

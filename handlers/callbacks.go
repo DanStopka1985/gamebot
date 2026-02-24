@@ -33,6 +33,31 @@ func NewCallbackHandler(bot *tgbotapi.BotAPI, adminIDs *map[int64]bool, userStat
 	}
 }
 
+// escapeMarkdown экранирует специальные символы для Markdown
+func escapeMarkdown(text string) string {
+	replacer := strings.NewReplacer(
+		"_", "\\_",
+		"*", "\\*",
+		"[", "\\[",
+		"]", "\\]",
+		"(", "\\(",
+		")", "\\)",
+		"~", "\\~",
+		"`", "\\`",
+		">", "\\>",
+		"#", "\\#",
+		"+", "\\+",
+		"-", "\\-",
+		"=", "\\=",
+		"|", "\\|",
+		"{", "\\{",
+		"}", "\\}",
+		".", "\\.",
+		"!", "\\!",
+	)
+	return replacer.Replace(text)
+}
+
 // isAdmin проверяет, является ли пользователь администратором
 func (h *CallbackHandler) isAdmin(userID int64) bool {
 	if h.AdminIDs == nil {
@@ -386,7 +411,6 @@ func (h *CallbackHandler) handleParticipantNamesWithSearch(message *tgbotapi.Mes
 }
 
 // identifyNextPlayer идентифицирует следующего игрока
-// identifyNextPlayer идентифицирует следующего игрока
 func (h *CallbackHandler) identifyNextPlayer(chatID int64, userID int64, index int) {
 	state, exists := h.UserStates[userID]
 	if !exists {
@@ -400,101 +424,11 @@ func (h *CallbackHandler) identifyNextPlayer(chatID int64, userID int64, index i
 		return
 	}
 
-	input := strings.ToLower(strings.TrimSpace(inputs[index]))
+	input := inputs[index]
 	state.TempData["current_index"] = index
 
-	// Проверяем, не указал ли пользователь "Я", "меня", "себя"
-	if input == "я" || input == "меня" || input == "себя" || input == "я сам" || input == "я сам(а)" {
-		// Используем данные самого пользователя
-		var person struct {
-			ID        int
-			Nikname   string
-			Firstname string
-			Lastname  string
-		}
-		err := database.DB.QueryRow(`
-			SELECT id, nikname, firstname, lastname
-			FROM person
-			WHERE telegram_id = $1
-		`, userID).Scan(&person.ID, &person.Nikname, &person.Firstname, &person.Lastname)
-
-		if err == nil {
-			// Формируем полное имя
-			fullName := ""
-			if person.Firstname != "" || person.Lastname != "" {
-				fullName = fmt.Sprintf("%s %s", person.Firstname, person.Lastname)
-				if person.Nikname != "" {
-					fullName = fmt.Sprintf("%s (@%s)", fullName, person.Nikname)
-				}
-			} else if person.Nikname != "" {
-				fullName = fmt.Sprintf("@%s", person.Nikname)
-			} else {
-				fullName = fmt.Sprintf("Пользователь %d", userID)
-			}
-
-			// Проверяем, есть ли уже этот пользователь в таблице players
-			var playerID int
-			var existingPlayerID int
-			var isNew bool = false
-
-			// Ищем по никнейму или имени
-			searchNick := ""
-			if person.Nikname != "" {
-				searchNick = "@" + person.Nikname
-			}
-
-			err = database.DB.QueryRow(`
-				SELECT id FROM players 
-				WHERE telegram_nick = $1 OR full_name = $2
-			`, searchNick, fullName).Scan(&existingPlayerID)
-
-			if err == nil {
-				// Уже есть в базе
-				playerID = existingPlayerID
-				log.Printf("✅ Найден существующий игрок в players: ID=%d", playerID)
-			} else {
-				// Добавляем в таблицу players
-				telegramNick := ""
-				if person.Nikname != "" {
-					telegramNick = "@" + person.Nikname
-				}
-
-				err = database.DB.QueryRow(`
-					INSERT INTO players (full_name, telegram_nick, telegram_name, notes, is_active)
-					VALUES ($1, $2, $3, $4, true)
-					RETURNING id
-				`, fullName, telegramNick, fullName, "Добавлен автоматически при записи").Scan(&playerID)
-
-				if err != nil {
-					log.Printf("❌ Ошибка добавления в players: %v", err)
-					playerID = 0
-				} else {
-					isNew = true
-					log.Printf("✅ Добавлен новый игрок в players: ID=%d, имя=%s", playerID, fullName)
-				}
-			}
-
-			// Сохраняем идентифицированного игрока
-			identified := state.TempData["identified_players"].([]map[string]interface{})
-			identified = append(identified, map[string]interface{}{
-				"player_id":     playerID,
-				"input":         inputs[index],
-				"method":        "self",
-				"full_name":     fullName,
-				"telegram_nick": person.Nikname,
-				"person_id":     person.ID,
-				"is_new":        isNew,
-			})
-			state.TempData["identified_players"] = identified
-
-			// Переходим к следующему
-			h.identifyNextPlayer(chatID, userID, index+1)
-			return
-		}
-	}
-
-	// Ищем игрока в базе players
-	results, err := utils.FindPlayer(database.DB, inputs[index])
+	// Ищем игрока
+	results, err := utils.FindPlayer(database.DB, input)
 	if err != nil {
 		log.Printf("❌ Ошибка поиска игрока: %v", err)
 		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка при поиске. Попробуйте еще раз."))
@@ -507,7 +441,7 @@ func (h *CallbackHandler) identifyNextPlayer(chatID int64, userID int64, index i
 			"🔍 Игрок #%d: %s\n\n"+
 				"❌ Не удалось найти в базе.\n\n"+
 				"Введите информацию об этом игроке вручную (имя, ник, любые данные):",
-			index+1, inputs[index])
+			index+1, input)
 
 		keyboard := tgbotapi.NewInlineKeyboardMarkup(
 			tgbotapi.NewInlineKeyboardRow(
@@ -517,6 +451,7 @@ func (h *CallbackHandler) identifyNextPlayer(chatID int64, userID int64, index i
 		)
 
 		msgObj := tgbotapi.NewMessage(chatID, msg)
+		// Убираем Markdown разметку для этого сообщения
 		msgObj.ParseMode = ""
 		msgObj.ReplyMarkup = keyboard
 		h.Bot.Send(msgObj)
@@ -529,8 +464,9 @@ func (h *CallbackHandler) identifyNextPlayer(chatID int64, userID int64, index i
 		// Найден один игрок - показываем для подтверждения
 		r := results[0]
 
+		// Экранируем специальные символы для Markdown
 		fullName := escapeMarkdown(r.FullName)
-		inputEscaped := escapeMarkdown(inputs[index])
+		inputEscaped := escapeMarkdown(input)
 
 		msg := fmt.Sprintf(
 			"🔍 Игрок #%d: *%s*\n\n"+
@@ -566,7 +502,7 @@ func (h *CallbackHandler) identifyNextPlayer(chatID int64, userID int64, index i
 
 	// Найдено несколько вариантов
 	msg := fmt.Sprintf("🔍 Игрок #%d: *%s*\n\nНайдено несколько вариантов. Выберите нужного:\n\n",
-		index+1, escapeMarkdown(inputs[index]))
+		index+1, escapeMarkdown(input))
 
 	var buttons [][]tgbotapi.InlineKeyboardButton
 	for i, r := range results {
@@ -593,31 +529,6 @@ func (h *CallbackHandler) identifyNextPlayer(chatID int64, userID int64, index i
 	h.Bot.Send(msgObj)
 
 	state.Step = "selecting"
-}
-
-// escapeMarkdown экранирует специальные символы для Markdown
-func escapeMarkdown(text string) string {
-	replacer := strings.NewReplacer(
-		"_", "\\_",
-		"*", "\\*",
-		"[", "\\[",
-		"]", "\\]",
-		"(", "\\(",
-		")", "\\)",
-		"~", "\\~",
-		"`", "\\`",
-		">", "\\>",
-		"#", "\\#",
-		"+", "\\+",
-		"-", "\\-",
-		"=", "\\=",
-		"|", "\\|",
-		"{", "\\{",
-		"}", "\\}",
-		".", "\\.",
-		"!", "\\!",
-	)
-	return replacer.Replace(text)
 }
 
 // handleIdentificationCallbacks обрабатывает callback'и идентификации
@@ -793,7 +704,6 @@ func (h *CallbackHandler) showIdentificationResult(chatID int64, userID int64) {
 
 	msg := "📋 *Результат идентификации игроков:*\n\n"
 	found := 0
-	newAdded := 0
 
 	for i, id := range identified {
 		// Проверяем, что индекс i не выходит за пределы inputs
@@ -816,17 +726,10 @@ func (h *CallbackHandler) showIdentificationResult(chatID int64, userID int64) {
 			} else {
 				fullName = "Неизвестно"
 			}
-
-			// Проверяем, новый ли это игрок
-			if isNew, ok := id["is_new"].(bool); ok && isNew {
-				newAdded++
-				msg += fmt.Sprintf("   ✅ *Добавлен в базу:* %s\n", escapeMarkdown(fullName))
-			} else {
-				msg += fmt.Sprintf("   ✅ *Найден в базе:* %s\n", escapeMarkdown(fullName))
-			}
+			msg += fmt.Sprintf("   ✅ *Найден:* %s\n", escapeMarkdown(fullName))
 
 			if nick, ok := id["telegram_nick"].(string); ok && nick != "" {
-				msg += fmt.Sprintf("   📱 @%s\n", escapeMarkdown(nick))
+				msg += fmt.Sprintf("   📱 %s\n", escapeMarkdown(nick))
 			}
 		} else {
 			fullName := ""
@@ -842,9 +745,6 @@ func (h *CallbackHandler) showIdentificationResult(chatID int64, userID int64) {
 	}
 
 	msg += fmt.Sprintf("\n📊 Итого: найдено %d из %d игроков", found, len(identified))
-	if newAdded > 0 {
-		msg += fmt.Sprintf("\n✨ Добавлено в базу: %d", newAdded)
-	}
 
 	// Проверяем, есть ли event_id в TempData
 	eventID := 0
@@ -951,14 +851,7 @@ func (h *CallbackHandler) registerForEventWithIdentification(chatID int64, event
 	for _, p := range identifiedPlayers {
 		if pid, ok := p["player_id"].(int); ok && pid > 0 {
 			playerIDs = append(playerIDs, int64(pid))
-			if isNew, ok := p["is_new"].(bool); ok && isNew {
-				participantNames = append(participantNames, fmt.Sprintf("%s (добавлен в базу)", p["full_name"]))
-			} else {
-				participantNames = append(participantNames, fmt.Sprintf("%s (ID:%d)", p["full_name"], pid))
-			}
-		} else if personID, ok := p["person_id"].(int); ok && personID > 0 {
-			// Это сам пользователь, но его нет в players
-			participantNames = append(participantNames, fmt.Sprintf("%s (не в базе игроков)", p["full_name"]))
+			participantNames = append(participantNames, fmt.Sprintf("%s (ID:%d)", p["full_name"], pid))
 		} else {
 			participantNames = append(participantNames, p["full_name"].(string))
 		}
@@ -1029,7 +922,6 @@ func (h *CallbackHandler) registerForEventWithIdentification(chatID int64, event
 		escapeMarkdown(eventDateTime.Format("15:04")))
 	successMsg += "📋 *Участники:*\n"
 
-	newPlayers := 0
 	for i, p := range identifiedPlayers {
 		fullName := ""
 		if fn, ok := p["full_name"].(string); ok {
@@ -1039,21 +931,10 @@ func (h *CallbackHandler) registerForEventWithIdentification(chatID int64, event
 		}
 
 		if pid, ok := p["player_id"].(int); ok && pid > 0 {
-			if isNew, ok := p["is_new"].(bool); ok && isNew {
-				newPlayers++
-				successMsg += fmt.Sprintf("%d. ✅ %s (добавлен в базу)\n", i+1, escapeMarkdown(fullName))
-			} else {
-				successMsg += fmt.Sprintf("%d. ✅ %s (из базы игроков)\n", i+1, escapeMarkdown(fullName))
-			}
-		} else if personID, ok := p["person_id"].(int); ok && personID > 0 {
-			successMsg += fmt.Sprintf("%d. ✅ %s (вы)\n", i+1, escapeMarkdown(fullName))
+			successMsg += fmt.Sprintf("%d. ✅ %s (идентифицирован)\n", i+1, escapeMarkdown(fullName))
 		} else {
 			successMsg += fmt.Sprintf("%d. ⚠️ %s (не в базе)\n", i+1, escapeMarkdown(fullName))
 		}
-	}
-
-	if newPlayers > 0 {
-		successMsg += fmt.Sprintf("\n✨ Добавлено в базу игроков: %d", newPlayers)
 	}
 
 	log.Printf("✅ Успешная регистрация на событие %d", eventID)
