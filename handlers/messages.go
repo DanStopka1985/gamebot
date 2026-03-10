@@ -24,16 +24,6 @@ type MessageHandler struct {
 	UserStates map[int64]*models.UserState
 }
 
-// truncateUTF8 безопасно обрезает строку с учетом UTF-8 символов
-func truncateUTF8(s string, maxLen int) string {
-	// Преобразуем в срез рун для правильной работы с UTF-8
-	runes := []rune(s)
-	if len(runes) <= maxLen {
-		return s
-	}
-	return string(runes[:maxLen]) + "…"
-}
-
 // NewMessageHandler создает новый обработчик сообщений
 func NewMessageHandler(bot *tgbotapi.BotAPI, adminIDs *map[int64]bool, userStates map[int64]*models.UserState) *MessageHandler {
 	return &MessageHandler{
@@ -56,27 +46,7 @@ func (h *MessageHandler) HandleMessage(message *tgbotapi.Message) {
 	utils.RegisterPersonIfNotExists(database.DB, message.From)
 
 	// Проверяем, есть ли у пользователя активное состояние
-	if state, exists := h.UserStates[userID]; exists {
-		// Для состояний, связанных с вводом имен и количества
-		if state.Action == "entering_names" {
-			// Проверяем, на каком мы шаге
-			if state.Step == "awaiting_names" {
-				// Только что ввели имена - начинаем поиск
-				callbackHandler := NewCallbackHandler(h.Bot, h.AdminIDs, h.UserStates)
-				callbackHandler.handleParticipantNamesWithSearch(message)
-				return
-			} else if state.Step == "manual_input" {
-				// Вводим данные вручную
-				callbackHandler := NewCallbackHandler(h.Bot, h.AdminIDs, h.UserStates)
-				callbackHandler.handleManualInput(message)
-				return
-			}
-		}
-		if state.Action == "entering_custom_count" {
-			callbackHandler := NewCallbackHandler(h.Bot, h.AdminIDs, h.UserStates)
-			callbackHandler.handleCustomCount(message)
-			return
-		}
+	if _, exists := h.UserStates[userID]; exists {
 		h.handleUserInput(message)
 		return
 	}
@@ -207,6 +177,52 @@ func (h *MessageHandler) showAdminMenu(chatID int64) {
 
 	if _, err := h.Bot.Send(msg); err != nil {
 		log.Printf("❌ Ошибка отправки меню администратора: %v", err)
+	}
+}
+
+// handleUserInput обрабатывает ввод пользователя для многошаговых действий
+func (h *MessageHandler) handleUserInput(message *tgbotapi.Message) {
+	userID := message.From.ID
+
+	state, exists := h.UserStates[userID]
+	if !exists {
+		log.Printf("⚠️ Нет активного состояния для пользователя %d", userID)
+		return
+	}
+
+	log.Printf("📝 Обработка ввода пользователя %d: действие=%s, шаг=%s",
+		userID, state.Action, state.Step)
+
+	switch state.Action {
+	case "add_event":
+		h.handleAddEventInput(message, state)
+	case "add_category":
+		h.handleAddCategoryInput(message, state)
+	case "edit_event":
+		h.handleEditEventInput(message, state)
+	case "add_player":
+		h.handleAddPlayerInput(message, state)
+	case "edit_player":
+		h.handleEditPlayerInput(message, state)
+	case "search_player":
+		h.handleSearchPlayerInput(message, state)
+	case "entering_names":
+		callbackHandler := NewCallbackHandler(h.Bot, h.AdminIDs, h.UserStates)
+		callbackHandler.handleParticipantNamesWithSearch(message)
+	case "entering_custom_count":
+		callbackHandler := NewCallbackHandler(h.Bot, h.AdminIDs, h.UserStates)
+		callbackHandler.handleCustomCount(message)
+	case "adding_more":
+		if state.Step == "entering_names" {
+			callbackHandler := NewCallbackHandler(h.Bot, h.AdminIDs, h.UserStates)
+			callbackHandler.handleAdditionalParticipantInput(message)
+		} else if state.Step == "awaiting_custom_count" {
+			callbackHandler := NewCallbackHandler(h.Bot, h.AdminIDs, h.UserStates)
+			callbackHandler.handleCustomAddMoreCount(message)
+		}
+	default:
+		log.Printf("⚠️ Неизвестное действие: %s", state.Action)
+		delete(h.UserStates, userID)
 	}
 }
 
@@ -510,7 +526,6 @@ func (h *MessageHandler) handleAddEventInput(message *tgbotapi.Message, state *m
 		limit, err := strconv.Atoi(text)
 		if err != nil || limit < 1 {
 			h.Bot.Send(tgbotapi.NewMessage(chatID,
-
 				"❌ Введите положительное число:"))
 			return
 		}
@@ -1308,38 +1323,6 @@ func (h *MessageHandler) handleMyEvents(message *tgbotapi.Message) {
 	}
 }
 
-// handleUserInput обрабатывает ввод пользователя для многошаговых действий
-func (h *MessageHandler) handleUserInput(message *tgbotapi.Message) {
-	userID := message.From.ID
-
-	state, exists := h.UserStates[userID]
-	if !exists {
-		log.Printf("⚠️ Нет активного состояния для пользователя %d", userID)
-		return
-	}
-
-	log.Printf("📝 Обработка ввода пользователя %d: действие=%s, шаг=%s",
-		userID, state.Action, state.Step)
-
-	switch state.Action {
-	case "add_event":
-		h.handleAddEventInput(message, state)
-	case "add_category":
-		h.handleAddCategoryInput(message, state)
-	case "edit_event":
-		h.handleEditEventInput(message, state)
-	case "add_player":
-		h.handleAddPlayerInput(message, state)
-	case "edit_player":
-		h.handleEditPlayerInput(message, state)
-	case "search_player":
-		h.handleSearchPlayerInput(message, state)
-	default:
-		log.Printf("⚠️ Неизвестное действие: %s", state.Action)
-		delete(h.UserStates, userID)
-	}
-}
-
 // handleEditEventInput обрабатывает ввод при редактировании события
 func (h *MessageHandler) handleEditEventInput(message *tgbotapi.Message, state *models.UserState) {
 	userID := message.From.ID
@@ -1469,6 +1452,16 @@ func splitMessage(text string, limit int) []string {
 		parts = append(parts, text)
 	}
 	return parts
+}
+
+// truncateUTF8 безопасно обрезает строку с учетом UTF-8 символов
+func truncateUTF8(s string, maxLen int) string {
+	// Преобразуем в срез рун для правильной работы с UTF-8
+	runes := []rune(s)
+	if len(runes) <= maxLen {
+		return s
+	}
+	return string(runes[:maxLen]) + "…"
 }
 
 // ==================== ФУНКЦИИ ДЛЯ УПРАВЛЕНИЯ PLAYERS ====================
@@ -1671,7 +1664,6 @@ func (h *MessageHandler) showPlayersList(chatID int64, page int, filter string) 
 
 				// Обрезаем имя с учетом UTF-8
 				displayName := fullName
-				// Максимальная длина для кнопки (примерно 22 символа)
 				if len([]rune(displayName)) > 22 {
 					displayName = truncateUTF8(displayName, 20)
 				}
