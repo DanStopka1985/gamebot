@@ -2301,19 +2301,29 @@ func (h *MessageHandler) showPaymentManagement(chatID int64) {
 
 	log.Printf("💰 Запрос меню управления оплатами от администратора %d", chatID)
 
-	// Получаем список событий с количеством неплативших
+	// Получаем список событий с количеством участников и неплательщиков
 	rows, err := database.DB.Query(`
 		SELECT 
 			e.id,
 			c.name as category_name,
 			e.evn_datetime,
-			COUNT(pe.id) as total_registrations,
-			COUNT(CASE WHEN pe.payment_status = 'pending' THEN 1 END) as unpaid_count
+			COALESCE(SUM(pe.participants_count), 0) as total_participants,
+			COALESCE(SUM(
+				CASE 
+					WHEN pe.identification_data IS NULL THEN pe.participants_count
+					ELSE (
+						SELECT COUNT(*)
+						FROM jsonb_array_elements(pe.identification_data) AS participant
+						WHERE (participant->>'payment_status') IS NULL 
+						   OR (participant->>'payment_status') = 'pending'
+					)
+				END
+			), 0) as unpaid_count
 		FROM event e
 		JOIN category c ON e.category_id = c.id
 		LEFT JOIN person_event pe ON e.id = pe.event_id AND pe.status = 'registered'
 		GROUP BY e.id, c.name, e.evn_datetime
-		HAVING COUNT(pe.id) > 0
+		HAVING COALESCE(SUM(pe.participants_count), 0) > 0
 		ORDER BY e.evn_datetime DESC
 	`)
 
@@ -2329,23 +2339,28 @@ func (h *MessageHandler) showPaymentManagement(chatID int64) {
 		tgbotapi.NewInlineKeyboardButtonData("💰 Все неплательщики", "admin:all_unpaid"),
 	))
 
+	eventCount := 0
 	for rows.Next() {
+		eventCount++
 		var id int
 		var categoryName string
 		var eventDate time.Time
-		var total, unpaid int
+		var totalParticipants, unpaidParticipants int
 
-		err := rows.Scan(&id, &categoryName, &eventDate, &total, &unpaid)
+		err := rows.Scan(&id, &categoryName, &eventDate, &totalParticipants, &unpaidParticipants)
 		if err != nil {
 			log.Printf("❌ Ошибка сканирования: %v", err)
 			continue
 		}
 
-		if unpaid > 0 {
+		log.Printf("📊 Событие %d: всего=%d, не платили=%d", id, totalParticipants, unpaidParticipants)
+
+		if unpaidParticipants > 0 {
 			buttonText := fmt.Sprintf("%s %s (%d/%d не платили)",
-				getPaymentEmoji(unpaid > 0),
+				getPaymentEmoji(unpaidParticipants > 0),
 				categoryName,
-				unpaid, total)
+				unpaidParticipants,
+				totalParticipants)
 
 			buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
 				tgbotapi.NewInlineKeyboardButtonData(buttonText,
@@ -2354,8 +2369,16 @@ func (h *MessageHandler) showPaymentManagement(chatID int64) {
 		}
 	}
 
-	if len(buttons) == 1 { // Только кнопка "Все неплательщики"
-		msg := tgbotapi.NewMessage(chatID, "💰 Все записи оплачены! 🎉")
+	// Если есть события, но все оплачены
+	if eventCount > 0 && len(buttons) == 1 {
+		msg := tgbotapi.NewMessage(chatID, "💰 Все участники оплатили! 🎉")
+		h.Bot.Send(msg)
+		return
+	}
+
+	// Если нет событий с участниками
+	if eventCount == 0 {
+		msg := tgbotapi.NewMessage(chatID, "📭 Нет событий с участниками")
 		h.Bot.Send(msg)
 		return
 	}
@@ -2402,7 +2425,7 @@ func (h *MessageHandler) showEventPayments(chatID int64, eventID int) {
 		return
 	}
 
-	// Получаем всех участников
+	// Получаем всех участников с информацией об оплате
 	rows, err := database.DB.Query(`
 		SELECT 
 			pe.id as person_event_id,
@@ -2431,6 +2454,11 @@ func (h *MessageHandler) showEventPayments(chatID int64, eventID int) {
 	paidCount := 0
 	var buttons [][]tgbotapi.InlineKeyboardButton
 
+	// Формируем заголовок
+	text = fmt.Sprintf("💰 *Оплаты: %s* (%s)\n\n",
+		eventInfo.CategoryName,
+		eventInfo.DateTime.Format("02.01.2006 15:04"))
+
 	for rows.Next() {
 		hasData = true
 		var peID int
@@ -2443,13 +2471,6 @@ func (h *MessageHandler) showEventPayments(chatID int64, eventID int) {
 		if err != nil {
 			log.Printf("❌ Ошибка сканирования: %v", err)
 			continue
-		}
-
-		// Если это первый элемент, формируем заголовок
-		if text == "" {
-			text = fmt.Sprintf("💰 *Оплаты: %s* (%s)\n\n",
-				eventInfo.CategoryName,
-				eventInfo.DateTime.Format("02.01.2006 15:04"))
 		}
 
 		// Формируем имя записавшего
@@ -2471,7 +2492,7 @@ func (h *MessageHandler) showEventPayments(chatID int64, eventID int) {
 		if len(identificationData) > 0 {
 			var identified []map[string]interface{}
 			if err := json.Unmarshal(identificationData, &identified); err == nil {
-				for _, p := range identified {
+				for idx, p := range identified {
 					totalParticipants++
 
 					// Получаем имя участника
@@ -2504,13 +2525,33 @@ func (h *MessageHandler) showEventPayments(chatID int64, eventID int) {
 
 					text += fmt.Sprintf("%s %s (записал: %s)\n",
 						paymentEmoji, displayName, registrantName)
+
+					// Добавляем кнопку для отметки об оплате, если еще не оплачено
+					if paymentStatus != "paid" {
+						buttonText := fmt.Sprintf("💰 Отметить: %s", displayName)
+						if len(buttonText) > 40 {
+							// Обрезаем если слишком длинное
+							runes := []rune(buttonText)
+							if len(runes) > 40 {
+								buttonText = string(runes[:37]) + "..."
+							}
+						}
+
+						// Создаем уникальный идентификатор для участника (person_event_id + индекс)
+						participantKey := fmt.Sprintf("%d_%d", peID, idx)
+						buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+							tgbotapi.NewInlineKeyboardButtonData(buttonText,
+								fmt.Sprintf("admin:mark_participant_paid:%s", participantKey)),
+						))
+					}
 				}
 			}
 		}
 	}
 
 	if !hasData {
-		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Нет записей на это событие"))
+		h.Bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf(
+			"❌ Нет записей на событие %s", eventInfo.CategoryName)))
 		return
 	}
 
@@ -2524,12 +2565,21 @@ func (h *MessageHandler) showEventPayments(chatID int64, eventID int) {
 		tgbotapi.NewInlineKeyboardButtonData("🔙 Назад к списку событий", "admin:back_to_payments"),
 	))
 
+	// Отправляем сообщение
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = "Markdown"
 	if len(buttons) > 0 {
 		msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(buttons...)
 	}
-	h.Bot.Send(msg)
+
+	if _, err := h.Bot.Send(msg); err != nil {
+		log.Printf("❌ Ошибка отправки: %v", err)
+		// Пробуем без Markdown
+		msg.ParseMode = ""
+		if _, err := h.Bot.Send(msg); err != nil {
+			log.Printf("❌ Критическая ошибка отправки: %v", err)
+		}
+	}
 }
 
 // getParticipantPaymentEmoji возвращает эмодзи для участника
