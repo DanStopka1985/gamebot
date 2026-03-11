@@ -350,20 +350,26 @@ func (h *CallbackHandler) showEventParticipants(chatID int64, eventID int) {
 			var identified []map[string]interface{}
 			if err := json.Unmarshal(identificationData, &identified); err == nil {
 				for _, p := range identified {
-					fullName := ""
-					if fn, ok := p["full_name"].(string); ok {
-						fullName = fn
+					// Получаем имя для отображения
+					displayName := ""
+					if fn, ok := p["full_name"].(string); ok && fn != "" {
+						displayName = fn
+					} else if input, ok := p["input"].(string); ok && input != "" {
+						displayName = input
 					} else {
-						fullName = "Неизвестно"
+						displayName = "Неизвестно"
 					}
-					fullName = escapeMarkdown(fullName)
+					displayName = escapeMarkdown(displayName)
 
-					text += fmt.Sprintf("%d. %s (записал: %s)\n",
-						participantNumber, fullName, registrantName)
-
+					// Получаем ник для отображения
+					nickDisplay := ""
 					if nick, ok := p["telegram_nick"].(string); ok && nick != "" {
-						text += fmt.Sprintf("   📱 %s\n", escapeMarkdown(nick))
+						nickDisplay = fmt.Sprintf(" %s", escapeMarkdown(nick))
 					}
+
+					text += fmt.Sprintf("%d. %s%s (записал: %s)\n",
+						participantNumber, displayName, nickDisplay, registrantName)
+
 					participantNumber++
 					totalParticipants++
 				}
@@ -745,6 +751,15 @@ func (h *CallbackHandler) handleParticipantNamesWithSearch(message *tgbotapi.Mes
 		return
 	}
 
+	// Проверяем, есть ли среди введенных строк "себя", "я", "меня"
+	for i, input := range inputs {
+		inputLower := strings.ToLower(input)
+		if inputLower == "себя" || inputLower == "я" || inputLower == "меня" {
+			// Заменяем на данные текущего пользователя
+			inputs[i] = fmt.Sprintf("@%s %s %s", message.From.UserName, message.From.FirstName, message.From.LastName)
+		}
+	}
+
 	// Сохраняем введенные строки
 	state.TempData["inputs"] = inputs
 	state.TempData["identified_players"] = []map[string]interface{}{}
@@ -774,7 +789,46 @@ func (h *CallbackHandler) identifyNextPlayer(chatID int64, userID int64, index i
 	input := inputs[index]
 	state.TempData["current_index"] = index
 
-	// Ищем игрока
+	// Проверяем, не является ли это специальным значением "себя"
+	inputLower := strings.ToLower(input)
+	if inputLower == "себя" || inputLower == "я" || inputLower == "меня" {
+		// Это сам пользователь
+		// Получаем данные пользователя из таблицы person
+		var personID int64
+		var nikname, firstname, lastname string
+		_ = database.DB.QueryRow(`
+			SELECT id, nikname, firstname, lastname FROM person WHERE telegram_id = $1
+		`, userID).Scan(&personID, &nikname, &firstname, &lastname)
+
+		// Получаем username из Telegram (нужно где-то хранить, но пока используем то что есть)
+		telegramUsername := ""
+		if nikname != "" {
+			telegramUsername = "@" + nikname
+		}
+
+		// Формируем полное имя
+		fullName := fmt.Sprintf("%s %s", firstname, lastname)
+		if strings.TrimSpace(fullName) == "" {
+			if nikname != "" {
+				fullName = nikname
+			} else {
+				fullName = "Пользователь"
+			}
+		}
+
+		identified := state.TempData["identified_players"].([]map[string]interface{})
+		identified = append(identified, map[string]interface{}{
+			"player_id":     0,
+			"input":         input,
+			"full_name":     fullName,
+			"telegram_nick": telegramUsername,
+		})
+		state.TempData["identified_players"] = identified
+		h.identifyNextPlayer(chatID, userID, index+1)
+		return
+	}
+
+	// Ищем игрока в базе players
 	results, err := utils.FindPlayer(database.DB, input)
 	if err != nil {
 		log.Printf("❌ Ошибка поиска игрока: %v", err)
@@ -783,7 +837,7 @@ func (h *CallbackHandler) identifyNextPlayer(chatID int64, userID int64, index i
 	}
 
 	if len(results) == 0 {
-		// Игрок не найден - сохраняем как есть и переходим к следующему
+		// Игрок не найден - сохраняем как есть
 		identified := state.TempData["identified_players"].([]map[string]interface{})
 		identified = append(identified, map[string]interface{}{
 			"player_id": 0,
@@ -982,11 +1036,22 @@ func (h *CallbackHandler) registerForEventWithIdentification(chatID int64, event
 
 	var participantNames []string
 	for _, p := range identifiedPlayers {
+		// Получаем имя для отображения
+		displayName := ""
+		if fn, ok := p["full_name"].(string); ok && fn != "" {
+			displayName = fn
+		} else if input, ok := p["input"].(string); ok && input != "" {
+			displayName = input
+		} else {
+			displayName = "Неизвестно"
+		}
+
+		// Если есть player_id, добавляем ID
 		if pid, ok := p["player_id"].(int); ok && pid > 0 {
 			playerIDs = append(playerIDs, int64(pid))
-			participantNames = append(participantNames, fmt.Sprintf("%s (ID:%d)", p["full_name"], pid))
+			participantNames = append(participantNames, fmt.Sprintf("%s (ID:%d)", displayName, pid))
 		} else {
-			participantNames = append(participantNames, p["full_name"].(string))
+			participantNames = append(participantNames, displayName)
 		}
 	}
 	participantsInfo = strings.Join(participantNames, ", ")
@@ -1025,10 +1090,19 @@ func (h *CallbackHandler) registerForEventWithIdentification(chatID int64, event
 			// Формируем новую информацию
 			var allNames []string
 			for _, p := range allIdentified {
-				if pid, ok := p["player_id"].(int); ok && pid > 0 {
-					allNames = append(allNames, fmt.Sprintf("%s (ID:%d)", p["full_name"], pid))
+				displayName := ""
+				if fn, ok := p["full_name"].(string); ok && fn != "" {
+					displayName = fn
+				} else if input, ok := p["input"].(string); ok && input != "" {
+					displayName = input
 				} else {
-					allNames = append(allNames, p["full_name"].(string))
+					displayName = "Неизвестно"
+				}
+
+				if pid, ok := p["player_id"].(int); ok && pid > 0 {
+					allNames = append(allNames, fmt.Sprintf("%s (ID:%d)", displayName, pid))
+				} else {
+					allNames = append(allNames, displayName)
 				}
 			}
 			newParticipantsInfo := strings.Join(allNames, ", ")
@@ -1106,17 +1180,25 @@ func (h *CallbackHandler) registerForEventWithIdentification(chatID int64, event
 	successMsg += "📋 *Участники:*\n"
 
 	for i, p := range identifiedPlayers {
-		fullName := ""
-		if fn, ok := p["full_name"].(string); ok {
-			fullName = fn
+		displayName := ""
+		if fn, ok := p["full_name"].(string); ok && fn != "" {
+			displayName = fn
+		} else if input, ok := p["input"].(string); ok && input != "" {
+			displayName = input
 		} else {
-			fullName = "Неизвестно"
+			displayName = "Неизвестно"
+		}
+
+		// Добавляем ник если есть
+		nickPart := ""
+		if nick, ok := p["telegram_nick"].(string); ok && nick != "" {
+			nickPart = fmt.Sprintf(" %s", nick)
 		}
 
 		if pid, ok := p["player_id"].(int); ok && pid > 0 {
-			successMsg += fmt.Sprintf("%d. ✅ %s\n", i+1, escapeMarkdown(fullName))
+			successMsg += fmt.Sprintf("%d. ✅ %s%s\n", i+1, escapeMarkdown(displayName), escapeMarkdown(nickPart))
 		} else {
-			successMsg += fmt.Sprintf("%d. ⚠️ %s\n", i+1, escapeMarkdown(fullName))
+			successMsg += fmt.Sprintf("%d. ⚠️ %s%s\n", i+1, escapeMarkdown(displayName), escapeMarkdown(nickPart))
 		}
 	}
 
@@ -1787,22 +1869,33 @@ func (h *CallbackHandler) showEventDetails(chatID int64, eventID int, userID int
 			if err := json.Unmarshal(identificationData, &identified); err == nil {
 				text += "\n📋 *Ваши участники:*\n"
 				for i, p := range identified {
+					// Формируем полное имя для отображения
 					fullName := ""
-					if fn, ok := p["full_name"].(string); ok {
+					if fn, ok := p["full_name"].(string); ok && fn != "" {
 						fullName = fn
+					} else if input, ok := p["input"].(string); ok && input != "" {
+						fullName = input
 					} else {
 						fullName = "Неизвестно"
 					}
 
-					// Формируем текст для кнопки удаления с именем
-					buttonText := fmt.Sprintf("❌ Удалить %s", fullName)
-
 					// Добавляем ник если есть
+					nickPart := ""
 					if nick, ok := p["telegram_nick"].(string); ok && nick != "" {
-						buttonText = fmt.Sprintf("❌ %s %s", nick, fullName)
-						text += fmt.Sprintf("%d. %s %s\n", i+1, nick, fullName)
-					} else {
-						text += fmt.Sprintf("%d. %s\n", i+1, fullName)
+						nickPart = fmt.Sprintf("%s ", nick)
+					}
+
+					// Отображаем в тексте
+					text += fmt.Sprintf("%d. %s%s\n", i+1, nickPart, fullName)
+
+					// Формируем текст кнопки удаления - ВСЕГДА с префиксом "❌ Удалить"
+					buttonText := fmt.Sprintf("❌ Удалить %s%s", nickPart, fullName)
+					if len(buttonText) > 40 {
+						// Обрезаем если слишком длинное
+						runes := []rune(buttonText)
+						if len(runes) > 40 {
+							buttonText = string(runes[:37]) + "..."
+						}
 					}
 
 					// Добавляем кнопку удаления для каждого участника
