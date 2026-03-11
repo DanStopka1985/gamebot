@@ -309,9 +309,9 @@ func (h *CallbackHandler) showEventParticipants(chatID int64, eventID int) {
 	defer rows.Close()
 
 	text := fmt.Sprintf("📅 *%s* (%s %s)\n\n",
-		eventName,
-		eventDateTime.Format("02.01.2006"),
-		eventDateTime.Format("15:04"))
+		escapeMarkdown(eventName),
+		escapeMarkdown(eventDateTime.Format("02.01.2006")),
+		escapeMarkdown(eventDateTime.Format("15:04")))
 	text += "👥 *Список участников:*\n\n"
 
 	totalParticipants := 0
@@ -343,6 +343,7 @@ func (h *CallbackHandler) showEventParticipants(chatID int64, eventID int) {
 		if registrantName == "" {
 			registrantName = "Аноним"
 		}
+		registrantName = escapeMarkdown(registrantName)
 
 		// Парсим данные об участниках
 		if len(identificationData) > 0 {
@@ -355,12 +356,13 @@ func (h *CallbackHandler) showEventParticipants(chatID int64, eventID int) {
 					} else {
 						fullName = "Неизвестно"
 					}
+					fullName = escapeMarkdown(fullName)
 
 					text += fmt.Sprintf("%d. %s (записал: %s)\n",
 						participantNumber, fullName, registrantName)
 
 					if nick, ok := p["telegram_nick"].(string); ok && nick != "" {
-						text += fmt.Sprintf("   📱 %s\n", nick)
+						text += fmt.Sprintf("   📱 %s\n", escapeMarkdown(nick))
 					}
 					participantNumber++
 					totalParticipants++
@@ -1791,12 +1793,22 @@ func (h *CallbackHandler) showEventDetails(chatID int64, eventID int, userID int
 					} else {
 						fullName = "Неизвестно"
 					}
-					text += fmt.Sprintf("%d. %s\n", i+1, fullName)
+
+					// Формируем текст для кнопки удаления с именем
+					buttonText := fmt.Sprintf("❌ Удалить %s", fullName)
+
+					// Добавляем ник если есть
+					if nick, ok := p["telegram_nick"].(string); ok && nick != "" {
+						buttonText = fmt.Sprintf("❌ %s %s", nick, fullName)
+						text += fmt.Sprintf("%d. %s %s\n", i+1, nick, fullName)
+					} else {
+						text += fmt.Sprintf("%d. %s\n", i+1, fullName)
+					}
 
 					// Добавляем кнопку удаления для каждого участника
 					keyboard = append(keyboard, tgbotapi.NewInlineKeyboardRow(
 						tgbotapi.NewInlineKeyboardButtonData(
-							fmt.Sprintf("❌ Удалить %d", i+1),
+							buttonText,
 							fmt.Sprintf("remove_participant:%d:%d", eventID, i),
 						),
 					))
