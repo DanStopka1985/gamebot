@@ -24,6 +24,11 @@ type CallbackHandler struct {
 	UserStates map[int64]*models.UserState
 }
 
+// formatDateTime возвращает дату и время в нужном формате без экранирования
+func formatDateTime(t time.Time) string {
+	return t.Format("02.01.2006 15:04")
+}
+
 // NewCallbackHandler создает новый обработчик callback'ов
 func NewCallbackHandler(bot *tgbotapi.BotAPI, adminIDs *map[int64]bool, userStates map[int64]*models.UserState) *CallbackHandler {
 	return &CallbackHandler{
@@ -308,10 +313,9 @@ func (h *CallbackHandler) showEventParticipants(chatID int64, eventID int) {
 	}
 	defer rows.Close()
 
-	text := fmt.Sprintf("📅 *%s* (%s %s)\n\n",
+	text := fmt.Sprintf("📅 *%s* (%s)\n\n",
 		escapeMarkdown(eventName),
-		escapeMarkdown(eventDateTime.Format("02.01.2006")),
-		escapeMarkdown(eventDateTime.Format("15:04")))
+		formatDateTime(eventDateTime.Local()))
 	text += "👥 *Список участников:*\n\n"
 
 	totalParticipants := 0
@@ -359,7 +363,6 @@ func (h *CallbackHandler) showEventParticipants(chatID int64, eventID int) {
 					} else {
 						displayName = "Неизвестно"
 					}
-					displayName = escapeMarkdown(displayName)
 
 					// Получаем ник для отображения
 					nickDisplay := ""
@@ -368,7 +371,7 @@ func (h *CallbackHandler) showEventParticipants(chatID int64, eventID int) {
 					}
 
 					text += fmt.Sprintf("%d. %s%s (записал: %s)\n",
-						participantNumber, displayName, nickDisplay, registrantName)
+						participantNumber, escapeMarkdown(displayName), nickDisplay, registrantName)
 
 					participantNumber++
 					totalParticipants++
@@ -800,7 +803,7 @@ func (h *CallbackHandler) identifyNextPlayer(chatID int64, userID int64, index i
 			SELECT id, nikname, firstname, lastname FROM person WHERE telegram_id = $1
 		`, userID).Scan(&personID, &nikname, &firstname, &lastname)
 
-		// Получаем username из Telegram (нужно где-то хранить, но пока используем то что есть)
+		// Получаем username
 		telegramUsername := ""
 		if nikname != "" {
 			telegramUsername = "@" + nikname
@@ -816,7 +819,27 @@ func (h *CallbackHandler) identifyNextPlayer(chatID int64, userID int64, index i
 			}
 		}
 
+		// Проверяем, нет ли уже такого пользователя в списке
 		identified := state.TempData["identified_players"].([]map[string]interface{})
+		isDuplicate := false
+
+		// Проверяем по telegram_nick
+		for _, existing := range identified {
+			if existingNick, ok := existing["telegram_nick"].(string); ok && existingNick == telegramUsername {
+				isDuplicate = true
+				break
+			}
+		}
+
+		if isDuplicate {
+			// Если дубликат, пропускаем и переходим к следующему
+			h.Bot.Send(tgbotapi.NewMessage(chatID,
+				fmt.Sprintf("⚠️ Вы (%s) уже добавлены в список участников", telegramUsername)))
+			h.identifyNextPlayer(chatID, userID, index+1)
+			return
+		}
+
+		// Добавляем нового участника
 		identified = append(identified, map[string]interface{}{
 			"player_id":     0,
 			"input":         input,
@@ -852,9 +875,39 @@ func (h *CallbackHandler) identifyNextPlayer(chatID int64, userID int64, index i
 	}
 
 	if len(results) == 1 {
-		// Найден один игрок - сохраняем и переходим к следующему
+		// Найден один игрок - проверяем на дубликат
 		r := results[0]
+
+		// Проверяем, нет ли уже такого игрока в списке
 		identified := state.TempData["identified_players"].([]map[string]interface{})
+		isDuplicate := false
+
+		// Проверяем по ID игрока
+		for _, existing := range identified {
+			if existingID, ok := existing["player_id"].(int); ok && existingID == r.ID {
+				isDuplicate = true
+				break
+			}
+			// Также проверяем по нику
+			if existingNick, ok := existing["telegram_nick"].(string); ok && existingNick == r.TelegramNick {
+				isDuplicate = true
+				break
+			}
+		}
+
+		if isDuplicate {
+			// Если дубликат, пропускаем
+			displayName := r.FullName
+			if r.TelegramNick != "" {
+				displayName = fmt.Sprintf("%s %s", r.TelegramNick, r.FullName)
+			}
+			h.Bot.Send(tgbotapi.NewMessage(chatID,
+				fmt.Sprintf("⚠️ Игрок %s уже добавлен в список", displayName)))
+			h.identifyNextPlayer(chatID, userID, index+1)
+			return
+		}
+
+		// Добавляем нового участника
 		identified = append(identified, map[string]interface{}{
 			"player_id":     r.ID,
 			"input":         input,
@@ -1030,6 +1083,99 @@ func (h *CallbackHandler) registerForEventWithIdentification(chatID int64, event
 		WHERE person_id = $1 AND event_id = $2
 	`, dbPersonID, eventID).Scan(&existingID, &existingStatus)
 
+	// Если запись существует и активна, получаем существующие данные
+	var existingIdentified []map[string]interface{}
+	var existingPlayerIDs []int64
+
+	if err == nil && existingStatus == "registered" {
+		// Получаем существующие данные
+		var existingIdentificationData []byte
+		tx.QueryRow(`
+			SELECT identification_data, COALESCE(player_ids, ARRAY[]::INTEGER[])
+			FROM person_event WHERE id = $1
+		`, existingID).Scan(&existingIdentificationData, pq.Array(&existingPlayerIDs))
+
+		if len(existingIdentificationData) > 0 {
+			json.Unmarshal(existingIdentificationData, &existingIdentified)
+		}
+	}
+
+	// Проверяем на дубликаты
+	var duplicates []string
+	var newPlayers []map[string]interface{}
+
+	for _, p := range identifiedPlayers {
+		isDuplicate := false
+
+		// Проверяем по telegram_nick
+		if nick, ok := p["telegram_nick"].(string); ok && nick != "" {
+			for _, existing := range existingIdentified {
+				if existingNick, ok := existing["telegram_nick"].(string); ok && existingNick == nick {
+					isDuplicate = true
+					break
+				}
+			}
+		}
+
+		// Если нет ника, проверяем по полному имени
+		if !isDuplicate {
+			fullName := ""
+			if fn, ok := p["full_name"].(string); ok {
+				fullName = fn
+			} else if input, ok := p["input"].(string); ok {
+				fullName = input
+			}
+
+			if fullName != "" {
+				for _, existing := range existingIdentified {
+					existingName := ""
+					if en, ok := existing["full_name"].(string); ok {
+						existingName = en
+					}
+					if existingName == fullName && fullName != "себя" && fullName != "я" && fullName != "меня" {
+						isDuplicate = true
+						break
+					}
+				}
+			}
+		}
+
+		if isDuplicate {
+			// Формируем имя для сообщения о дубликате
+			displayName := ""
+			if nick, ok := p["telegram_nick"].(string); ok && nick != "" {
+				displayName = nick
+			} else if fn, ok := p["full_name"].(string); ok {
+				displayName = fn
+			} else if input, ok := p["input"].(string); ok {
+				displayName = input
+			}
+			duplicates = append(duplicates, displayName)
+		} else {
+			newPlayers = append(newPlayers, p)
+		}
+	}
+
+	// Если есть дубликаты, показываем сообщение
+	if len(duplicates) > 0 {
+		dupMsg := "⚠️ Следующие игроки уже были записаны ранее и не добавлены:\n"
+		for _, name := range duplicates {
+			dupMsg += fmt.Sprintf("• %s\n", name)
+		}
+		h.Bot.Send(tgbotapi.NewMessage(chatID, dupMsg))
+
+		// Если после удаления дубликатов не осталось новых игроков, выходим
+		if len(newPlayers) == 0 {
+			h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Новых участников не добавлено"))
+			h.showEventDetails(chatID, eventID, userID)
+			return
+		}
+
+		// Обновляем identifiedPlayers для дальнейшей обработки
+		identifiedPlayers = newPlayers
+		count = len(newPlayers)
+	}
+
 	// Формируем информацию об участниках
 	var participantsInfo string
 	var playerIDs []int64
@@ -1059,91 +1205,76 @@ func (h *CallbackHandler) registerForEventWithIdentification(chatID int64, event
 	// Сохраняем информацию об идентифицированных игроках в JSON
 	identifiedJSON, _ := json.Marshal(identifiedPlayers)
 
-	if err == nil {
-		// Запись уже существует
-		if existingStatus == "registered" {
-			// Уже активная запись - обновляем, добавляя новых участников
-			log.Printf("🔄 Обновление существующей записи ID=%d со статусом %s", existingID, existingStatus)
+	if err == nil && existingStatus == "registered" {
+		// Уже активная запись - обновляем, добавляя новых участников
+		log.Printf("🔄 Обновление существующей записи ID=%d", existingID)
 
-			// Получаем существующие данные
-			var existingPlayerIDs []int64
-			var existingIdentificationData []byte
-			var existingParticipantsInfo sql.NullString
-			var existingCount int
+		// Объединяем существующих и новых участников
+		allIdentified := existingIdentified
+		allIdentified = append(allIdentified, identifiedPlayers...)
 
-			tx.QueryRow(`
-				SELECT participants_count, participants_info, player_ids, identification_data
-				FROM person_event WHERE id = $1
-			`, existingID).Scan(&existingCount, &existingParticipantsInfo, pq.Array(&existingPlayerIDs), &existingIdentificationData)
+		// Объединяем player_ids
+		var allPlayerIDs []int64
+		allPlayerIDs = append(allPlayerIDs, existingPlayerIDs...)
+		allPlayerIDs = append(allPlayerIDs, playerIDs...)
 
-			// Объединяем существующих и новых участников
-			var allIdentified []map[string]interface{}
-			if len(existingIdentificationData) > 0 {
-				json.Unmarshal(existingIdentificationData, &allIdentified)
+		// Формируем новую информацию
+		var allNames []string
+		for _, p := range allIdentified {
+			displayName := ""
+			if fn, ok := p["full_name"].(string); ok && fn != "" {
+				displayName = fn
+			} else if input, ok := p["input"].(string); ok && input != "" {
+				displayName = input
+			} else {
+				displayName = "Неизвестно"
 			}
-			allIdentified = append(allIdentified, identifiedPlayers...)
 
-			// Объединяем player_ids
-			allPlayerIDs := existingPlayerIDs
-			allPlayerIDs = append(allPlayerIDs, playerIDs...)
-
-			// Формируем новую информацию
-			var allNames []string
-			for _, p := range allIdentified {
-				displayName := ""
-				if fn, ok := p["full_name"].(string); ok && fn != "" {
-					displayName = fn
-				} else if input, ok := p["input"].(string); ok && input != "" {
-					displayName = input
-				} else {
-					displayName = "Неизвестно"
-				}
-
-				if pid, ok := p["player_id"].(int); ok && pid > 0 {
-					allNames = append(allNames, fmt.Sprintf("%s (ID:%d)", displayName, pid))
-				} else {
-					allNames = append(allNames, displayName)
-				}
+			if pid, ok := p["player_id"].(int); ok && pid > 0 {
+				allNames = append(allNames, fmt.Sprintf("%s (ID:%d)", displayName, pid))
+			} else {
+				allNames = append(allNames, displayName)
 			}
-			newParticipantsInfo := strings.Join(allNames, ", ")
-			newCount := len(allIdentified)
-			updatedJSON, _ := json.Marshal(allIdentified)
+		}
+		newParticipantsInfo := strings.Join(allNames, ", ")
+		newCount := len(allIdentified)
+		updatedJSON, _ := json.Marshal(allIdentified)
 
-			_, err = tx.Exec(`
-				UPDATE person_event 
-				SET participants_count = $1,
-				    participants_info = $2,
-				    player_ids = $3,
-				    identification_data = $4,
-				    registered_at = NOW()
-				WHERE id = $5
-			`, newCount, newParticipantsInfo, pq.Array(allPlayerIDs), updatedJSON, existingID)
+		_, err = tx.Exec(`
+			UPDATE person_event 
+			SET participants_count = $1,
+			    participants_info = $2,
+			    player_ids = $3,
+			    identification_data = $4,
+			    registered_at = NOW()
+			WHERE id = $5
+		`, newCount, newParticipantsInfo, pq.Array(allPlayerIDs), updatedJSON, existingID)
 
-			if err != nil {
-				log.Printf("❌ Ошибка обновления записи: %v", err)
-				h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка регистрации"))
-				return
-			}
-		} else {
-			// Была отмененная запись - обновляем её
-			log.Printf("🔄 Обновление отмененной записи ID=%d", existingID)
+		if err != nil {
+			log.Printf("❌ Ошибка обновления записи: %v", err)
+			h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка регистрации"))
+			return
+		}
 
-			_, err = tx.Exec(`
-				UPDATE person_event 
-				SET status = 'registered', 
-				    participants_count = $1, 
-				    registered_at = NOW(), 
-				    participants_info = $2,
-				    player_ids = $3,
-				    identification_data = $4
-				WHERE id = $5
-			`, count, participantsInfo, pq.Array(playerIDs), identifiedJSON, existingID)
+	} else if err == nil {
+		// Была отмененная запись - обновляем её
+		log.Printf("🔄 Обновление отмененной записи ID=%d", existingID)
 
-			if err != nil {
-				log.Printf("❌ Ошибка обновления записи: %v", err)
-				h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка регистрации"))
-				return
-			}
+		_, err = tx.Exec(`
+			UPDATE person_event 
+			SET status = 'registered', 
+			    participants_count = $1, 
+			    registered_at = NOW(), 
+			    participants_info = $2,
+			    player_ids = $3,
+			    identification_data = $4
+			WHERE id = $5
+		`, count, participantsInfo, pq.Array(playerIDs), identifiedJSON, existingID)
+
+		if err != nil {
+			log.Printf("❌ Ошибка обновления записи: %v", err)
+			h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка регистрации"))
+			return
 		}
 	} else {
 		// Нет записи - создаем новую
@@ -1173,10 +1304,9 @@ func (h *CallbackHandler) registerForEventWithIdentification(chatID int64, event
 	}
 
 	// Формируем сообщение об успехе
-	successMsg := fmt.Sprintf("✅ Вы успешно записаны на *%s* (%s %s)!\n\n",
+	successMsg := fmt.Sprintf("✅ Вы успешно записаны на *%s* (%s)!\n\n",
 		escapeMarkdown(eventName),
-		escapeMarkdown(eventDateTime.Format("02.01.2006")),
-		escapeMarkdown(eventDateTime.Format("15:04")))
+		formatDateTime(eventDateTime.Local()))
 	successMsg += "📋 *Участники:*\n"
 
 	for i, p := range identifiedPlayers {
@@ -1200,6 +1330,11 @@ func (h *CallbackHandler) registerForEventWithIdentification(chatID int64, event
 		} else {
 			successMsg += fmt.Sprintf("%d. ⚠️ %s%s\n", i+1, escapeMarkdown(displayName), escapeMarkdown(nickPart))
 		}
+	}
+
+	// Если были дубликаты, добавляем информацию
+	if len(duplicates) > 0 {
+		successMsg += "\n⚠️ Некоторые игроки не были добавлены, так как уже записаны ранее."
 	}
 
 	log.Printf("✅ Успешная регистрация на событие %d", eventID)
@@ -1399,8 +1534,94 @@ func (h *CallbackHandler) handleAdditionalParticipantInput(message *tgbotapi.Mes
 
 	currentIndex := state.TempData["current_index"].(int)
 	totalCount := state.TempData["total_count"].(int)
+	eventID := state.TempData["event_id"].(int)
 
-	// Ищем игрока по введенным данным
+	// Получаем существующих участников из текущей сессии
+	additional := state.TempData["additional_players"].([]map[string]interface{})
+
+	// Также получаем уже записанных участников из БД для проверки дубликатов
+	var existingIdentified []map[string]interface{}
+
+	// Получаем ID пользователя в БД
+	var dbPersonID int
+	_ = database.DB.QueryRow(`SELECT id FROM person WHERE telegram_id = $1`, userID).Scan(&dbPersonID)
+
+	// Получаем существующую запись
+	var identificationData []byte
+	_ = database.DB.QueryRow(`
+		SELECT COALESCE(identification_data, '[]'::JSONB)
+		FROM person_event 
+		WHERE person_id = $1 AND event_id = $2 AND status = 'registered'
+	`, dbPersonID, eventID).Scan(&identificationData)
+
+	if len(identificationData) > 0 {
+		json.Unmarshal(identificationData, &existingIdentified)
+	}
+
+	// Проверяем, не является ли это специальным значением "себя"
+	inputLower := strings.ToLower(text)
+	if inputLower == "себя" || inputLower == "я" || inputLower == "меня" {
+		// Это сам пользователь
+		var nikname, firstname, lastname string
+		_ = database.DB.QueryRow(`
+			SELECT nikname, firstname, lastname FROM person WHERE telegram_id = $1
+		`, userID).Scan(&nikname, &firstname, &lastname)
+
+		telegramUsername := ""
+		if nikname != "" {
+			telegramUsername = "@" + nikname
+		}
+
+		fullName := fmt.Sprintf("%s %s", firstname, lastname)
+		if strings.TrimSpace(fullName) == "" {
+			if nikname != "" {
+				fullName = nikname
+			} else {
+				fullName = "Пользователь"
+			}
+		}
+
+		// Проверяем на дубликат в текущей сессии
+		for _, p := range additional {
+			if pNick, ok := p["telegram_nick"].(string); ok && pNick == telegramUsername {
+				h.Bot.Send(tgbotapi.NewMessage(chatID,
+					"⚠️ Вы уже добавлены в список в этой сессии"))
+				h.askAdditionalNames(chatID, eventID, userID, totalCount, currentIndex)
+				return
+			}
+		}
+
+		// Проверяем на дубликат в БД
+		for _, p := range existingIdentified {
+			if pNick, ok := p["telegram_nick"].(string); ok && pNick == telegramUsername {
+				h.Bot.Send(tgbotapi.NewMessage(chatID,
+					"⚠️ Вы уже записаны на это событие"))
+				h.askAdditionalNames(chatID, eventID, userID, totalCount, currentIndex)
+				return
+			}
+		}
+
+		// Добавляем нового участника
+		additional = append(additional, map[string]interface{}{
+			"player_id":     0,
+			"input":         text,
+			"full_name":     fullName,
+			"telegram_nick": telegramUsername,
+		})
+		state.TempData["additional_players"] = additional
+
+		// Переходим к следующему или завершаем
+		if currentIndex+1 < totalCount {
+			h.askAdditionalNames(chatID, eventID, userID, totalCount, currentIndex+1)
+		} else {
+			// Все собрали, сразу добавляем
+			h.addMoreParticipants(chatID, eventID, userID, additional)
+			delete(h.UserStates, userID)
+		}
+		return
+	}
+
+	// Ищем игрока в базе players
 	results, err := utils.FindPlayer(database.DB, text)
 	if err != nil {
 		log.Printf("❌ Ошибка поиска игрока: %v", err)
@@ -1409,8 +1630,17 @@ func (h *CallbackHandler) handleAdditionalParticipantInput(message *tgbotapi.Mes
 	}
 
 	if len(results) == 0 {
-		// Игрок не найден - сохраняем как есть
-		additional := state.TempData["additional_players"].([]map[string]interface{})
+		// Игрок не найден - проверяем на дубликат по тексту
+		for _, p := range additional {
+			if pInput, ok := p["input"].(string); ok && pInput == text {
+				h.Bot.Send(tgbotapi.NewMessage(chatID,
+					fmt.Sprintf("⚠️ Игрок '%s' уже добавлен в этой сессии", text)))
+				h.askAdditionalNames(chatID, eventID, userID, totalCount, currentIndex)
+				return
+			}
+		}
+
+		// Сохраняем как есть
 		additional = append(additional, map[string]interface{}{
 			"player_id": 0,
 			"input":     text,
@@ -1420,11 +1650,9 @@ func (h *CallbackHandler) handleAdditionalParticipantInput(message *tgbotapi.Mes
 
 		// Переходим к следующему или завершаем
 		if currentIndex+1 < totalCount {
-			h.askAdditionalNames(chatID, state.TempData["event_id"].(int), userID, totalCount, currentIndex+1)
+			h.askAdditionalNames(chatID, eventID, userID, totalCount, currentIndex+1)
 		} else {
 			// Все собрали, сразу добавляем
-			eventID := state.TempData["event_id"].(int)
-			additional := state.TempData["additional_players"].([]map[string]interface{})
 			h.addMoreParticipants(chatID, eventID, userID, additional)
 			delete(h.UserStates, userID)
 		}
@@ -1432,9 +1660,42 @@ func (h *CallbackHandler) handleAdditionalParticipantInput(message *tgbotapi.Mes
 	}
 
 	if len(results) == 1 {
-		// Найден один игрок - сохраняем
+		// Найден один игрок - проверяем на дубликат
 		r := results[0]
-		additional := state.TempData["additional_players"].([]map[string]interface{})
+
+		// Проверяем в текущей сессии
+		for _, p := range additional {
+			if pID, ok := p["player_id"].(int); ok && pID == r.ID {
+				h.Bot.Send(tgbotapi.NewMessage(chatID,
+					fmt.Sprintf("⚠️ Игрок %s уже добавлен в этой сессии", r.FullName)))
+				h.askAdditionalNames(chatID, eventID, userID, totalCount, currentIndex)
+				return
+			}
+			if pNick, ok := p["telegram_nick"].(string); ok && pNick == r.TelegramNick {
+				h.Bot.Send(tgbotapi.NewMessage(chatID,
+					fmt.Sprintf("⚠️ Игрок %s уже добавлен в этой сессии", r.FullName)))
+				h.askAdditionalNames(chatID, eventID, userID, totalCount, currentIndex)
+				return
+			}
+		}
+
+		// Проверяем в БД
+		for _, p := range existingIdentified {
+			if pID, ok := p["player_id"].(float64); ok && int(pID) == r.ID {
+				h.Bot.Send(tgbotapi.NewMessage(chatID,
+					fmt.Sprintf("⚠️ Игрок %s уже записан на это событие", r.FullName)))
+				h.askAdditionalNames(chatID, eventID, userID, totalCount, currentIndex)
+				return
+			}
+			if pNick, ok := p["telegram_nick"].(string); ok && pNick == r.TelegramNick {
+				h.Bot.Send(tgbotapi.NewMessage(chatID,
+					fmt.Sprintf("⚠️ Игрок %s уже записан на это событие", r.FullName)))
+				h.askAdditionalNames(chatID, eventID, userID, totalCount, currentIndex)
+				return
+			}
+		}
+
+		// Добавляем нового участника
 		additional = append(additional, map[string]interface{}{
 			"player_id":     r.ID,
 			"input":         text,
@@ -1446,11 +1707,9 @@ func (h *CallbackHandler) handleAdditionalParticipantInput(message *tgbotapi.Mes
 
 		// Переходим к следующему или завершаем
 		if currentIndex+1 < totalCount {
-			h.askAdditionalNames(chatID, state.TempData["event_id"].(int), userID, totalCount, currentIndex+1)
+			h.askAdditionalNames(chatID, eventID, userID, totalCount, currentIndex+1)
 		} else {
 			// Все собрали, сразу добавляем
-			eventID := state.TempData["event_id"].(int)
-			additional := state.TempData["additional_players"].([]map[string]interface{})
 			h.addMoreParticipants(chatID, eventID, userID, additional)
 			delete(h.UserStates, userID)
 		}
@@ -1498,14 +1757,54 @@ func (h *CallbackHandler) handleAdditionalSelection(callback *tgbotapi.CallbackQ
 		return
 	}
 
+	eventID := state.TempData["event_id"].(int)
+	totalCount := state.TempData["total_count"].(int)
+
+	// Получаем существующих участников из текущей сессии
+	additional := state.TempData["additional_players"].([]map[string]interface{})
+
+	// Получаем уже записанных участников из БД
+	var existingIdentified []map[string]interface{}
+	var dbPersonID int
+	_ = database.DB.QueryRow(`SELECT id FROM person WHERE telegram_id = $1`, userID).Scan(&dbPersonID)
+
+	var identificationData []byte
+	_ = database.DB.QueryRow(`
+		SELECT COALESCE(identification_data, '[]'::JSONB)
+		FROM person_event 
+		WHERE person_id = $1 AND event_id = $2 AND status = 'registered'
+	`, dbPersonID, eventID).Scan(&identificationData)
+
+	if len(identificationData) > 0 {
+		json.Unmarshal(identificationData, &existingIdentified)
+	}
+
 	switch data[0] {
 	case "select_additional":
 		if len(data) < 4 {
 			return
 		}
-		currentIndex, _ := strconv.Atoi(data[1])
+		idx, _ := strconv.Atoi(data[1])
 		playerID, _ := strconv.Atoi(data[2])
-		totalCount, _ := strconv.Atoi(data[3])
+
+		// Проверяем на дубликат
+		for _, p := range additional {
+			if pID, ok := p["player_id"].(int); ok && pID == playerID {
+				h.Bot.Send(tgbotapi.NewMessage(chatID,
+					"⚠️ Этот игрок уже добавлен в этой сессии"))
+				h.askAdditionalNames(chatID, eventID, userID, totalCount, idx)
+				return
+			}
+		}
+
+		for _, p := range existingIdentified {
+			if pID, ok := p["player_id"].(float64); ok && int(pID) == playerID {
+				h.Bot.Send(tgbotapi.NewMessage(chatID,
+					"⚠️ Этот игрок уже записан на событие"))
+				h.askAdditionalNames(chatID, eventID, userID, totalCount, idx)
+				return
+			}
+		}
 
 		// Получаем информацию об игроке
 		var player struct {
@@ -1518,7 +1817,6 @@ func (h *CallbackHandler) handleAdditionalSelection(callback *tgbotapi.CallbackQ
 			FROM players WHERE id = $1
 		`, playerID).Scan(&player.FullName, &player.TelegramNick, &player.TelegramName)
 
-		additional := state.TempData["additional_players"].([]map[string]interface{})
 		additional = append(additional, map[string]interface{}{
 			"player_id":     playerID,
 			"full_name":     player.FullName,
@@ -1528,12 +1826,10 @@ func (h *CallbackHandler) handleAdditionalSelection(callback *tgbotapi.CallbackQ
 		state.TempData["additional_players"] = additional
 
 		// Переходим к следующему или завершаем
-		if currentIndex+1 < totalCount {
-			h.askAdditionalNames(chatID, state.TempData["event_id"].(int), userID, totalCount, currentIndex+1)
+		if idx+1 < totalCount {
+			h.askAdditionalNames(chatID, eventID, userID, totalCount, idx+1)
 		} else {
 			// Все собрали, сразу добавляем
-			eventID := state.TempData["event_id"].(int)
-			additional := state.TempData["additional_players"].([]map[string]interface{})
 			h.addMoreParticipants(chatID, eventID, userID, additional)
 			delete(h.UserStates, userID)
 		}
@@ -1542,24 +1838,31 @@ func (h *CallbackHandler) handleAdditionalSelection(callback *tgbotapi.CallbackQ
 		if len(data) < 3 {
 			return
 		}
-		currentIndex, _ := strconv.Atoi(data[1])
+		idx, _ := strconv.Atoi(data[1])
 		text := data[2]
-		totalCount := state.TempData["total_count"].(int)
 
-		additional := state.TempData["additional_players"].([]map[string]interface{})
+		// Проверяем на дубликат по тексту
+		for _, p := range additional {
+			if pInput, ok := p["input"].(string); ok && pInput == text {
+				h.Bot.Send(tgbotapi.NewMessage(chatID,
+					fmt.Sprintf("⚠️ Игрок '%s' уже добавлен в этой сессии", text)))
+				h.askAdditionalNames(chatID, eventID, userID, totalCount, idx)
+				return
+			}
+		}
+
 		additional = append(additional, map[string]interface{}{
 			"player_id": 0,
 			"full_name": text,
+			"input":     text,
 		})
 		state.TempData["additional_players"] = additional
 
 		// Переходим к следующему или завершаем
-		if currentIndex+1 < totalCount {
-			h.askAdditionalNames(chatID, state.TempData["event_id"].(int), userID, totalCount, currentIndex+1)
+		if idx+1 < totalCount {
+			h.askAdditionalNames(chatID, eventID, userID, totalCount, idx+1)
 		} else {
 			// Все собрали, сразу добавляем
-			eventID := state.TempData["event_id"].(int)
-			additional := state.TempData["additional_players"].([]map[string]interface{})
 			h.addMoreParticipants(chatID, eventID, userID, additional)
 			delete(h.UserStates, userID)
 		}
@@ -1821,6 +2124,9 @@ func (h *CallbackHandler) showEventDetails(chatID int64, eventID int, userID int
 		return
 	}
 
+	// Конвертируем в локальное время
+	e.DateTime = e.DateTime.Local()
+
 	var isRegistered bool
 	var dbPersonID int
 	database.DB.QueryRow(`SELECT id FROM person WHERE telegram_id = $1`, userID).Scan(&dbPersonID)
@@ -1888,7 +2194,7 @@ func (h *CallbackHandler) showEventDetails(chatID int64, eventID int, userID int
 					// Отображаем в тексте
 					text += fmt.Sprintf("%d. %s%s\n", i+1, nickPart, fullName)
 
-					// Формируем текст кнопки удаления - ВСЕГДА с префиксом "❌ Удалить"
+					// Формируем текст кнопки удаления
 					buttonText := fmt.Sprintf("❌ Удалить %s%s", nickPart, fullName)
 					if len(buttonText) > 40 {
 						// Обрезаем если слишком длинное
