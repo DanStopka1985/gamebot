@@ -508,7 +508,8 @@ func (h *MessageHandler) handleAddEventInput(message *tgbotapi.Message, state *m
 
 	switch state.Step {
 	case "awaiting_datetime":
-		datetime, err := time.Parse("2006-01-02 15:04", text)
+		// Парсим время в локальном часовом поясе
+		datetime, err := time.ParseInLocation("2006-01-02 15:04", text, time.Local)
 		if err != nil {
 			log.Printf("❌ Неверный формат даты: %v", err)
 			h.Bot.Send(tgbotapi.NewMessage(chatID,
@@ -516,7 +517,8 @@ func (h *MessageHandler) handleAddEventInput(message *tgbotapi.Message, state *m
 			return
 		}
 
-		state.TempData["datetime"] = datetime
+		// Сохраняем в UTC для базы данных
+		state.TempData["datetime"] = datetime.UTC()
 		state.Step = "awaiting_limit"
 
 		h.Bot.Send(tgbotapi.NewMessage(chatID,
@@ -533,6 +535,8 @@ func (h *MessageHandler) handleAddEventInput(message *tgbotapi.Message, state *m
 		state.TempData["limit"] = limit
 
 		datetime := state.TempData["datetime"].(time.Time)
+		// Для отображения используем локальное время
+		localTime := datetime.Local()
 		preview := fmt.Sprintf(
 			"📅 Предварительный просмотр события:\n\n"+
 				"Категория ID: %d\n"+
@@ -540,7 +544,7 @@ func (h *MessageHandler) handleAddEventInput(message *tgbotapi.Message, state *m
 				"👥 Лимит: %d\n\n"+
 				"Подтвердить создание?",
 			state.CategoryID,
-			datetime.Format("02.01.2006 15:04"),
+			localTime.Format("02.01.2006 15:04"),
 			limit,
 		)
 
@@ -586,11 +590,12 @@ func (h *MessageHandler) confirmAddEvent(chatID int64, userID int64) {
 	}
 
 	var eventID int
+	// Сохраняем в UTC
 	err := database.DB.QueryRow(`
 		INSERT INTO event (category_id, evn_datetime, member_limit)
 		VALUES ($1, $2, $3)
 		RETURNING id
-	`, state.CategoryID, datetime, limit).Scan(&eventID)
+	`, state.CategoryID, datetime.UTC(), limit).Scan(&eventID)
 
 	if err != nil {
 		log.Printf("❌ Ошибка создания события: %v", err)
@@ -602,9 +607,11 @@ func (h *MessageHandler) confirmAddEvent(chatID int64, userID int64) {
 	var categoryName string
 	database.DB.QueryRow(`SELECT name FROM category WHERE id = $1`, state.CategoryID).Scan(&categoryName)
 
+	// Для отображения используем локальное время
+	localTime := datetime.Local()
 	h.Bot.Send(tgbotapi.NewMessage(chatID,
 		fmt.Sprintf("✅ Событие '%s' на %s успешно создано! ID: #%d",
-			categoryName, datetime.Format("02.01.2006 15:04"), eventID)))
+			categoryName, localTime.Format("02.01.2006 15:04"), eventID)))
 
 	delete(h.UserStates, userID)
 }
@@ -637,11 +644,15 @@ func (h *MessageHandler) showAllEvents(chatID int64) {
 	for rows.Next() {
 		count++
 		var e models.Event
-		err := rows.Scan(&e.ID, &e.CategoryName, &e.DateTime, &e.MemberLimit, &e.Registered)
+		var dbDateTime time.Time
+		err := rows.Scan(&e.ID, &e.CategoryName, &dbDateTime, &e.MemberLimit, &e.Registered)
 		if err != nil {
 			log.Printf("❌ Ошибка сканирования: %v", err)
 			continue
 		}
+
+		// Конвертируем в локальное время для отображения
+		e.DateTime = dbDateTime.Local()
 
 		text := fmt.Sprintf(
 			"🆔 *%d* | %s\n📆 %s\n👥 %d/%d\n",
