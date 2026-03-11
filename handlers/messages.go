@@ -9,12 +9,11 @@ import (
 	"strings"
 	"time"
 
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"github.com/lib/pq"
-
 	"gamebot/database"
 	"gamebot/models"
 	"gamebot/utils"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
 // MessageHandler обработчик текстовых сообщений
@@ -114,6 +113,8 @@ func (h *MessageHandler) handleAdminText(message *tgbotapi.Message) {
 		h.startAddCategory(message)
 	case "👥 Управление игроками":
 		h.showPlayersMenu(chatID)
+	case "💰 Управление оплатами":
+		h.showPaymentManagement(chatID)
 	case "📋 Список игроков":
 		h.showPlayersList(chatID, 1, "")
 	case "➕ Добавить игрока":
@@ -168,6 +169,7 @@ func (h *MessageHandler) showAdminMenu(chatID int64) {
 		),
 		tgbotapi.NewKeyboardButtonRow(
 			tgbotapi.NewKeyboardButton("👥 Управление игроками"),
+			tgbotapi.NewKeyboardButton("💰 Управление оплатами"),
 		),
 	)
 	keyboard.ResizeKeyboard = true
@@ -779,6 +781,7 @@ func (h *MessageHandler) showEventRegistrations(chatID int64, eventID int) {
 
 	log.Printf("👥 Запрос записей для события %d от администратора %d", eventID, chatID)
 
+	// Получаем информацию о событии
 	var eventInfo struct {
 		CategoryName string
 		DateTime     time.Time
@@ -796,6 +799,7 @@ func (h *MessageHandler) showEventRegistrations(chatID int64, eventID int) {
 		return
 	}
 
+	// Получаем все записи для этого события
 	rows, err := database.DB.Query(`
 		SELECT 
 			p.id as person_id,
@@ -803,8 +807,6 @@ func (h *MessageHandler) showEventRegistrations(chatID int64, eventID int) {
 			p.firstname,
 			p.lastname,
 			pe.participants_count,
-			pe.participants_info,
-			pe.player_ids,
 			pe.identification_data,
 			pe.registered_at
 		FROM person_event pe
@@ -820,24 +822,25 @@ func (h *MessageHandler) showEventRegistrations(chatID int64, eventID int) {
 	}
 	defer rows.Close()
 
+	// Проверяем, есть ли данные
+	var hasData bool
 	var allEntries []string
 	totalParticipants := 0
 	totalRegistrations := 0
 	totalIdentified := 0
 
 	for rows.Next() {
+		hasData = true
 		totalRegistrations++
 
 		var personID int64
 		var nikname, firstname, lastname string
 		var participants int
-		var participantsInfo sql.NullString
-		var playerIDs []int64
 		var identificationData []byte
 		var regDate time.Time
 
 		err := rows.Scan(&personID, &nikname, &firstname, &lastname,
-			&participants, &participantsInfo, pq.Array(&playerIDs), &identificationData, &regDate)
+			&participants, &identificationData, &regDate)
 		if err != nil {
 			log.Printf("❌ Ошибка сканирования: %v", err)
 			continue
@@ -873,30 +876,43 @@ func (h *MessageHandler) showEventRegistrations(chatID int64, eventID int) {
 			if err := json.Unmarshal(identificationData, &identified); err == nil {
 				for i, id := range identified {
 					totalParticipants++
-					if pid, ok := id["player_id"].(float64); ok && pid > 0 {
-						totalIdentified++
-						entry += fmt.Sprintf("   %d. ✅ *%s* (ID: %.0f)\n",
-							i+1, id["full_name"], pid)
+
+					// Получаем имя участника
+					fullName := ""
+					if fn, ok := id["full_name"].(string); ok && fn != "" {
+						fullName = fn
+					} else if input, ok := id["input"].(string); ok && input != "" {
+						fullName = input
 					} else {
-						entry += fmt.Sprintf("   %d. ⚠️ *%s* (не в базе)\n",
-							i+1, id["full_name"])
+						fullName = "Неизвестно"
+					}
+
+					// Получаем ник
+					nickPart := ""
+					if nick, ok := id["telegram_nick"].(string); ok && nick != "" {
+						nickPart = fmt.Sprintf(" %s", nick)
+					}
+
+					// Получаем статус оплаты
+					paymentStatus := "pending"
+					if ps, ok := id["payment_status"].(string); ok {
+						paymentStatus = ps
+					}
+
+					paymentEmoji := "⏳"
+					if paymentStatus == "paid" {
+						paymentEmoji = "💰"
+						totalIdentified++
+					}
+
+					if pid, ok := id["player_id"].(float64); ok && pid > 0 {
+						entry += fmt.Sprintf("   %d. %s ✅ *%s*%s (ID: %.0f)\n",
+							i+1, paymentEmoji, fullName, nickPart, pid)
+					} else {
+						entry += fmt.Sprintf("   %d. %s ⚠️ *%s*%s (не в базе)\n",
+							i+1, paymentEmoji, fullName, nickPart)
 					}
 				}
-			} else {
-				// Если не смогли распарсить JSON, показываем обычную информацию
-				if participantsInfo.Valid {
-					names := strings.Split(participantsInfo.String, ", ")
-					for i, name := range names {
-						totalParticipants++
-						entry += fmt.Sprintf("   %d. %s\n", i+1, name)
-					}
-				}
-			}
-		} else if participantsInfo.Valid {
-			names := strings.Split(participantsInfo.String, ", ")
-			for i, name := range names {
-				totalParticipants++
-				entry += fmt.Sprintf("   %d. %s\n", i+1, name)
 			}
 		}
 
@@ -904,21 +920,22 @@ func (h *MessageHandler) showEventRegistrations(chatID int64, eventID int) {
 		allEntries = append(allEntries, entry)
 	}
 
+	if !hasData {
+		h.Bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf(
+			"📊 *Событие: %s*\n📆 *Дата:* %s\n\n❌ Нет записей на это событие",
+			eventInfo.CategoryName,
+			eventInfo.DateTime.Format("02.01.2006 15:04"))))
+		return
+	}
+
 	header := fmt.Sprintf("📊 *Событие: %s*\n", eventInfo.CategoryName)
 	header += fmt.Sprintf("📆 *Дата:* %s\n", eventInfo.DateTime.Format("02.01.2006 15:04"))
 	header += fmt.Sprintf("📝 *Всего записей:* %d\n", totalRegistrations)
 	header += fmt.Sprintf("👥 *Всего участников:* %d\n", totalParticipants)
-	header += fmt.Sprintf("✅ *Идентифицировано:* %d\n", totalIdentified)
+	header += fmt.Sprintf("💰 *Оплатили:* %d\n", totalIdentified)
 	header += "════════════════════════════════════════\n\n"
 
-	cleanHeader := strings.ToValidUTF8(header, "?")
-
-	var fullText string
-	if len(allEntries) == 0 {
-		fullText = cleanHeader + "❌ Нет записей на это событие"
-	} else {
-		fullText = cleanHeader + strings.Join(allEntries, "")
-	}
+	fullText := header + strings.Join(allEntries, "")
 
 	backButton := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
@@ -2272,4 +2289,492 @@ func (h *MessageHandler) showPlayerHistory(chatID int64, playerID int) {
 	msg.ParseMode = "Markdown"
 	msg.ReplyMarkup = keyboard
 	h.Bot.Send(msg)
+}
+
+// ==================== ФУНКЦИИ ДЛЯ УПРАВЛЕНИЯ ОПЛАТОЙ ====================
+
+// showPaymentManagement показывает меню управления оплатами
+func (h *MessageHandler) showPaymentManagement(chatID int64) {
+	if !h.isAdmin(chatID) {
+		return
+	}
+
+	log.Printf("💰 Запрос меню управления оплатами от администратора %d", chatID)
+
+	// Получаем список событий с количеством неплативших
+	rows, err := database.DB.Query(`
+		SELECT 
+			e.id,
+			c.name as category_name,
+			e.evn_datetime,
+			COUNT(pe.id) as total_registrations,
+			COUNT(CASE WHEN pe.payment_status = 'pending' THEN 1 END) as unpaid_count
+		FROM event e
+		JOIN category c ON e.category_id = c.id
+		LEFT JOIN person_event pe ON e.id = pe.event_id AND pe.status = 'registered'
+		GROUP BY e.id, c.name, e.evn_datetime
+		HAVING COUNT(pe.id) > 0
+		ORDER BY e.evn_datetime DESC
+	`)
+
+	if err != nil {
+		log.Printf("❌ Ошибка загрузки событий: %v", err)
+		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка загрузки"))
+		return
+	}
+	defer rows.Close()
+
+	var buttons [][]tgbotapi.InlineKeyboardButton
+	buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("💰 Все неплательщики", "admin:all_unpaid"),
+	))
+
+	for rows.Next() {
+		var id int
+		var categoryName string
+		var eventDate time.Time
+		var total, unpaid int
+
+		err := rows.Scan(&id, &categoryName, &eventDate, &total, &unpaid)
+		if err != nil {
+			log.Printf("❌ Ошибка сканирования: %v", err)
+			continue
+		}
+
+		if unpaid > 0 {
+			buttonText := fmt.Sprintf("%s %s (%d/%d не платили)",
+				getPaymentEmoji(unpaid > 0),
+				categoryName,
+				unpaid, total)
+
+			buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData(buttonText,
+					fmt.Sprintf("admin:payment_event:%d", id)),
+			))
+		}
+	}
+
+	if len(buttons) == 1 { // Только кнопка "Все неплательщики"
+		msg := tgbotapi.NewMessage(chatID, "💰 Все записи оплачены! 🎉")
+		h.Bot.Send(msg)
+		return
+	}
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(buttons...)
+
+	msg := tgbotapi.NewMessage(chatID, "💰 *Управление оплатами*\n\nВыберите событие для просмотра:")
+	msg.ParseMode = "Markdown"
+	msg.ReplyMarkup = keyboard
+	h.Bot.Send(msg)
+}
+
+// getPaymentEmoji возвращает эмодзи в зависимости от статуса оплаты
+func getPaymentEmoji(hasUnpaid bool) string {
+	if hasUnpaid {
+		return "💰"
+	}
+	return "✅"
+}
+
+// showEventPayments показывает список участников события с отметками об оплате
+func (h *MessageHandler) showEventPayments(chatID int64, eventID int) {
+	if !h.isAdmin(chatID) {
+		return
+	}
+
+	log.Printf("💰 Запрос оплат для события %d от администратора %d", eventID, chatID)
+
+	// Получаем информацию о событии
+	var eventInfo struct {
+		CategoryName string
+		DateTime     time.Time
+	}
+	err := database.DB.QueryRow(`
+		SELECT c.name, e.evn_datetime
+		FROM event e
+		JOIN category c ON e.category_id = c.id
+		WHERE e.id = $1
+	`, eventID).Scan(&eventInfo.CategoryName, &eventInfo.DateTime)
+
+	if err != nil {
+		log.Printf("❌ Ошибка загрузки события: %v", err)
+		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка загрузки события"))
+		return
+	}
+
+	// Получаем всех участников
+	rows, err := database.DB.Query(`
+		SELECT 
+			pe.id as person_event_id,
+			p.nikname,
+			p.firstname,
+			p.lastname,
+			pe.identification_data,
+			pe.registered_at
+		FROM person_event pe
+		JOIN person p ON pe.person_id = p.id
+		WHERE pe.event_id = $1 AND pe.status = 'registered'
+		ORDER BY pe.registered_at
+	`, eventID)
+
+	if err != nil {
+		log.Printf("❌ Ошибка загрузки участников: %v", err)
+		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка загрузки"))
+		return
+	}
+	defer rows.Close()
+
+	// Проверяем, есть ли данные
+	var hasData bool
+	var text string
+	totalParticipants := 0
+	paidCount := 0
+	var buttons [][]tgbotapi.InlineKeyboardButton
+
+	for rows.Next() {
+		hasData = true
+		var peID int
+		var nikname, firstname, lastname string
+		var identificationData []byte
+		var registeredAt time.Time
+
+		err := rows.Scan(&peID, &nikname, &firstname, &lastname,
+			&identificationData, &registeredAt)
+		if err != nil {
+			log.Printf("❌ Ошибка сканирования: %v", err)
+			continue
+		}
+
+		// Если это первый элемент, формируем заголовок
+		if text == "" {
+			text = fmt.Sprintf("💰 *Оплаты: %s* (%s)\n\n",
+				eventInfo.CategoryName,
+				eventInfo.DateTime.Format("02.01.2006 15:04"))
+		}
+
+		// Формируем имя записавшего
+		registrantName := ""
+		if nikname != "" {
+			registrantName += "@" + nikname
+		}
+		if firstname != "" || lastname != "" {
+			if registrantName != "" {
+				registrantName += " "
+			}
+			registrantName += firstname + " " + lastname
+		}
+		if registrantName == "" {
+			registrantName = "Аноним"
+		}
+
+		// Парсим участников
+		if len(identificationData) > 0 {
+			var identified []map[string]interface{}
+			if err := json.Unmarshal(identificationData, &identified); err == nil {
+				for _, p := range identified {
+					totalParticipants++
+
+					// Получаем имя участника
+					participantName := ""
+					if fn, ok := p["full_name"].(string); ok && fn != "" {
+						participantName = fn
+					} else if input, ok := p["input"].(string); ok && input != "" {
+						participantName = input
+					} else {
+						participantName = "Неизвестно"
+					}
+
+					// Добавляем ник если есть
+					displayName := participantName
+					if nick, ok := p["telegram_nick"].(string); ok && nick != "" {
+						displayName = fmt.Sprintf("%s %s", nick, participantName)
+					}
+
+					// Получаем статус оплаты
+					paymentStatus := "pending"
+					if ps, ok := p["payment_status"].(string); ok {
+						paymentStatus = ps
+					}
+
+					paymentEmoji := "⏳"
+					if paymentStatus == "paid" {
+						paymentEmoji = "💰"
+						paidCount++
+					}
+
+					text += fmt.Sprintf("%s %s (записал: %s)\n",
+						paymentEmoji, displayName, registrantName)
+				}
+			}
+		}
+	}
+
+	if !hasData {
+		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Нет записей на это событие"))
+		return
+	}
+
+	// Добавляем статистику
+	text += fmt.Sprintf("\n📊 *Всего участников: %d*", totalParticipants)
+	text += fmt.Sprintf("\n💰 *Оплатили: %d*", paidCount)
+	text += fmt.Sprintf("\n⏳ *Ожидают оплаты: %d*", totalParticipants-paidCount)
+
+	// Добавляем кнопку "Назад"
+	buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("🔙 Назад к списку событий", "admin:back_to_payments"),
+	))
+
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = "Markdown"
+	if len(buttons) > 0 {
+		msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(buttons...)
+	}
+	h.Bot.Send(msg)
+}
+
+// getParticipantPaymentEmoji возвращает эмодзи для участника
+func getParticipantPaymentEmoji(isPaid bool) string {
+	if isPaid {
+		return "💰"
+	}
+	return "⏳"
+}
+
+// showAllUnpaid показывает всех неплательщиков по всем событиям
+func (h *MessageHandler) showAllUnpaid(chatID int64) {
+	if !h.isAdmin(chatID) {
+		return
+	}
+
+	log.Printf("💰 Запрос всех неплательщиков от администратора %d", chatID)
+
+	rows, err := database.DB.Query(`
+		SELECT 
+			e.id as event_id,
+			c.name as category_name,
+			e.evn_datetime,
+			p.nikname,
+			p.firstname,
+			p.lastname,
+			pe.id as person_event_id,
+			pe.identification_data
+		FROM person_event pe
+		JOIN event e ON pe.event_id = e.id
+		JOIN category c ON e.category_id = c.id
+		JOIN person p ON pe.person_id = p.id
+		WHERE pe.status = 'registered' AND pe.payment_status = 'pending'
+		ORDER BY e.evn_datetime DESC
+	`)
+
+	if err != nil {
+		log.Printf("❌ Ошибка загрузки: %v", err)
+		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка загрузки"))
+		return
+	}
+	defer rows.Close()
+
+	text := "💰 *Неплательщики по всем событиям*\n\n"
+	currentEventID := 0
+	var buttons [][]tgbotapi.InlineKeyboardButton
+
+	for rows.Next() {
+		var eventID int
+		var categoryName string
+		var eventDate time.Time
+		var nikname, firstname, lastname string
+		var peID int
+		var identificationData []byte
+
+		err := rows.Scan(&eventID, &categoryName, &eventDate, &nikname, &firstname, &lastname,
+			&peID, &identificationData)
+		if err != nil {
+			log.Printf("❌ Ошибка сканирования: %v", err)
+			continue
+		}
+
+		if eventID != currentEventID {
+			if currentEventID != 0 {
+				text += "\n"
+			}
+			currentEventID = eventID
+			text += fmt.Sprintf("📅 *%s* (%s)\n",
+				categoryName,
+				eventDate.Format("02.01.2006 15:04"))
+		}
+
+		// Формируем имя записавшего
+		registrantName := ""
+		if nikname != "" {
+			registrantName += "@" + nikname
+		}
+		if firstname != "" || lastname != "" {
+			if registrantName != "" {
+				registrantName += " "
+			}
+			registrantName += firstname + " " + lastname
+		}
+
+		// Парсим участников
+		if len(identificationData) > 0 {
+			var identified []map[string]interface{}
+			if err := json.Unmarshal(identificationData, &identified); err == nil {
+				for _, p := range identified {
+					participantName := ""
+					if fn, ok := p["full_name"].(string); ok && fn != "" {
+						participantName = fn
+					} else if input, ok := p["input"].(string); ok && input != "" {
+						participantName = input
+					}
+
+					if nick, ok := p["telegram_nick"].(string); ok && nick != "" {
+						participantName = fmt.Sprintf("%s %s", nick, participantName)
+					}
+
+					text += fmt.Sprintf("  ⏳ %s (записал: %s)\n", participantName, registrantName)
+				}
+			}
+		}
+
+		// Добавляем кнопку для отметки
+		buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(
+				fmt.Sprintf("💰 Отметить: %s", registrantName),
+				fmt.Sprintf("admin:mark_paid:%d", peID)),
+		))
+	}
+
+	if currentEventID == 0 {
+		text += "✅ Все записи оплачены! 🎉"
+	}
+
+	buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("🔙 Назад", "admin:back_to_payments"),
+	))
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(buttons...)
+
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = "Markdown"
+	msg.ReplyMarkup = keyboard
+	h.Bot.Send(msg)
+}
+
+// markAsPaid отмечает запись как оплаченную
+func (h *MessageHandler) markAsPaid(chatID int64, personEventID int) {
+	if !h.isAdmin(chatID) {
+		return
+	}
+
+	log.Printf("💰 Отметка об оплате записи %d администратором %d", personEventID, chatID)
+
+	result, err := database.DB.Exec(`
+		UPDATE person_event 
+		SET payment_status = 'paid', 
+		    payment_date = NOW() 
+		WHERE id = $1 AND payment_status = 'pending'
+	`, personEventID)
+
+	if err != nil {
+		log.Printf("❌ Ошибка отметки об оплате: %v", err)
+		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка при отметке"))
+		return
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Запись не найдена или уже оплачена"))
+		return
+	}
+
+	h.Bot.Send(tgbotapi.NewMessage(chatID, "✅ Отмечено как оплачено"))
+}
+
+// markParticipantAsPaid отмечает конкретного участника как оплатившего
+func (h *MessageHandler) markParticipantAsPaid(chatID int64, participantKey string) {
+	if !h.isAdmin(chatID) {
+		return
+	}
+
+	// Парсим ключ: person_event_id_index
+	parts := strings.Split(participantKey, "_")
+	if len(parts) != 2 {
+		log.Printf("❌ Неверный формат ключа: %s", participantKey)
+		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка формата данных"))
+		return
+	}
+
+	peID, _ := strconv.Atoi(parts[0])
+	idx, _ := strconv.Atoi(parts[1])
+
+	log.Printf("💰 Отметка участника (запись %d, индекс %d) администратором %d", peID, idx, chatID)
+
+	// Получаем текущие данные
+	var identificationData []byte
+	err := database.DB.QueryRow(`
+		SELECT identification_data FROM person_event WHERE id = $1
+	`, peID).Scan(&identificationData)
+
+	if err != nil {
+		log.Printf("❌ Ошибка загрузки данных: %v", err)
+		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Запись не найдена"))
+		return
+	}
+
+	// Парсим JSON
+	var identified []map[string]interface{}
+	if err := json.Unmarshal(identificationData, &identified); err != nil {
+		log.Printf("❌ Ошибка парсинга JSON: %v", err)
+		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка данных"))
+		return
+	}
+
+	if idx < 0 || idx >= len(identified) {
+		log.Printf("❌ Неверный индекс: %d", idx)
+		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Участник не найден"))
+		return
+	}
+
+	// Отмечаем как оплаченного
+	identified[idx]["payment_status"] = "paid"
+	identified[idx]["payment_date"] = time.Now().Format(time.RFC3339)
+
+	// Сохраняем обратно
+	updatedJSON, _ := json.Marshal(identified)
+	_, err = database.DB.Exec(`
+		UPDATE person_event SET identification_data = $1 WHERE id = $2
+	`, updatedJSON, peID)
+
+	if err != nil {
+		log.Printf("❌ Ошибка сохранения: %v", err)
+		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка при сохранении"))
+		return
+	}
+
+	h.Bot.Send(tgbotapi.NewMessage(chatID, "✅ Участник отмечен как оплативший"))
+}
+
+// markAllAsPaid отмечает все записи на событие как оплаченные
+func (h *MessageHandler) markAllAsPaid(chatID int64, eventID int) {
+	if !h.isAdmin(chatID) {
+		return
+	}
+
+	log.Printf("💰 Отметка всех записей на событие %d как оплаченных администратором %d", eventID, chatID)
+
+	result, err := database.DB.Exec(`
+		UPDATE person_event 
+		SET payment_status = 'paid', 
+		    payment_date = NOW() 
+		WHERE event_id = $1 AND status = 'registered' AND payment_status = 'pending'
+	`, eventID)
+
+	if err != nil {
+		log.Printf("❌ Ошибка массовой отметки: %v", err)
+		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка при отметке"))
+		return
+	}
+
+	rows, _ := result.RowsAffected()
+	h.Bot.Send(tgbotapi.NewMessage(chatID,
+		fmt.Sprintf("✅ Отмечено как оплачено: %d записей", rows)))
 }

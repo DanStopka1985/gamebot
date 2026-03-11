@@ -297,7 +297,6 @@ func (h *CallbackHandler) showEventParticipants(chatID int64, eventID int) {
 			p.nikname,
 			p.firstname,
 			p.lastname,
-			pe.participants_count,
 			pe.identification_data,
 			pe.registered_at
 		FROM person_event pe
@@ -313,24 +312,32 @@ func (h *CallbackHandler) showEventParticipants(chatID int64, eventID int) {
 	}
 	defer rows.Close()
 
-	text := fmt.Sprintf("📅 *%s* (%s)\n\n",
-		escapeMarkdown(eventName),
-		formatDateTime(eventDateTime.Local()))
-	text += "👥 *Список участников:*\n\n"
-
+	// Проверяем, есть ли данные
+	var hasData bool
+	var text string
 	totalParticipants := 0
+	paidParticipants := 0
 	participantNumber := 1
 
 	for rows.Next() {
+		hasData = true
 		var nikname, firstname, lastname string
-		var participantsCount int
 		var identificationData []byte
 		var registeredAt time.Time
 
-		err := rows.Scan(&nikname, &firstname, &lastname, &participantsCount, &identificationData, &registeredAt)
+		err := rows.Scan(&nikname, &firstname, &lastname,
+			&identificationData, &registeredAt)
 		if err != nil {
 			log.Printf("❌ Ошибка сканирования: %v", err)
 			continue
+		}
+
+		// Если это первый элемент, формируем заголовок
+		if text == "" {
+			text = fmt.Sprintf("📅 *%s* (%s)\n\n",
+				escapeMarkdown(eventName),
+				formatDateTime(eventDateTime.Local()))
+			text += "👥 *Список участников:*\n\n"
 		}
 
 		// Формируем имя записавшего
@@ -370,29 +377,38 @@ func (h *CallbackHandler) showEventParticipants(chatID int64, eventID int) {
 						nickDisplay = fmt.Sprintf(" %s", escapeMarkdown(nick))
 					}
 
-					text += fmt.Sprintf("%d. %s%s (записал: %s)\n",
-						participantNumber, escapeMarkdown(displayName), nickDisplay, registrantName)
+					// Получаем статус оплаты для этого участника
+					paymentStatus := "pending"
+					if ps, ok := p["payment_status"].(string); ok {
+						paymentStatus = ps
+					}
+
+					// Добавляем эмодзи оплаты
+					paymentEmoji := "⏳"
+					if paymentStatus == "paid" {
+						paymentEmoji = "💰"
+						paidParticipants++
+					}
+
+					text += fmt.Sprintf("%d. %s %s%s (записал: %s)\n",
+						participantNumber, paymentEmoji, escapeMarkdown(displayName), nickDisplay, registrantName)
 
 					participantNumber++
 					totalParticipants++
 				}
 			}
-		} else {
-			// Если нет данных об участниках, показываем количество
-			for i := 1; i <= participantsCount; i++ {
-				text += fmt.Sprintf("%d. Участник #%d (записал: %s)\n",
-					participantNumber, i, registrantName)
-				participantNumber++
-				totalParticipants++
-			}
 		}
 	}
 
-	if totalParticipants == 0 {
-		text += "❌ Пока никто не записался"
-	} else {
-		text += fmt.Sprintf("\n📊 Всего участников: %d", totalParticipants)
+	if !hasData {
+		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Нет записей на это событие"))
+		return
 	}
+
+	// Добавляем статистику
+	text += fmt.Sprintf("\n📊 *Всего участников: %d*", totalParticipants)
+	text += fmt.Sprintf("\n💰 *Оплатили: %d*", paidParticipants)
+	text += fmt.Sprintf("\n⏳ *Ожидают оплаты: %d*", totalParticipants-paidParticipants)
 
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
@@ -1075,7 +1091,15 @@ func (h *CallbackHandler) registerForEventWithIdentification(chatID int64, event
 		return
 	}
 
-	// Проверяем, есть ли уже запись (в любом статусе)
+	// Добавляем статус оплаты для каждого участника (по умолчанию "pending")
+	for i := range identifiedPlayers {
+		identifiedPlayers[i]["payment_status"] = "pending"
+	}
+
+	// Сохраняем информацию об идентифицированных игроках в JSON
+	identifiedJSON, _ := json.Marshal(identifiedPlayers)
+
+	// Проверяем, есть ли уже запись
 	var existingID int
 	var existingStatus string
 	err = tx.QueryRow(`
@@ -1083,217 +1107,85 @@ func (h *CallbackHandler) registerForEventWithIdentification(chatID int64, event
 		WHERE person_id = $1 AND event_id = $2
 	`, dbPersonID, eventID).Scan(&existingID, &existingStatus)
 
-	// Если запись существует и активна, получаем существующие данные
-	var existingIdentified []map[string]interface{}
-	var existingPlayerIDs []int64
+	if err == nil {
+		// Запись уже существует - обновляем
+		if existingStatus == "registered" {
+			// Получаем существующие данные
+			var existingIdentificationData []byte
+			var existingParticipantsInfo sql.NullString
+			var existingCount int
 
-	if err == nil && existingStatus == "registered" {
-		// Получаем существующие данные
-		var existingIdentificationData []byte
-		tx.QueryRow(`
-			SELECT identification_data, COALESCE(player_ids, ARRAY[]::INTEGER[])
-			FROM person_event WHERE id = $1
-		`, existingID).Scan(&existingIdentificationData, pq.Array(&existingPlayerIDs))
+			tx.QueryRow(`
+				SELECT participants_count, participants_info, identification_data
+				FROM person_event WHERE id = $1
+			`, existingID).Scan(&existingCount, &existingParticipantsInfo, &existingIdentificationData)
 
-		if len(existingIdentificationData) > 0 {
-			json.Unmarshal(existingIdentificationData, &existingIdentified)
-		}
-	}
+			// Объединяем существующих и новых участников
+			var allIdentified []map[string]interface{}
+			if len(existingIdentificationData) > 0 {
+				json.Unmarshal(existingIdentificationData, &allIdentified)
+			}
+			allIdentified = append(allIdentified, identifiedPlayers...)
 
-	// Проверяем на дубликаты
-	var duplicates []string
-	var newPlayers []map[string]interface{}
-
-	for _, p := range identifiedPlayers {
-		isDuplicate := false
-
-		// Проверяем по telegram_nick
-		if nick, ok := p["telegram_nick"].(string); ok && nick != "" {
-			for _, existing := range existingIdentified {
-				if existingNick, ok := existing["telegram_nick"].(string); ok && existingNick == nick {
-					isDuplicate = true
-					break
+			// Формируем информацию
+			var allNames []string
+			for _, p := range allIdentified {
+				displayName := p["full_name"].(string)
+				if nick, ok := p["telegram_nick"].(string); ok && nick != "" {
+					displayName = fmt.Sprintf("%s %s", nick, displayName)
 				}
-			}
-		}
-
-		// Если нет ника, проверяем по полному имени
-		if !isDuplicate {
-			fullName := ""
-			if fn, ok := p["full_name"].(string); ok {
-				fullName = fn
-			} else if input, ok := p["input"].(string); ok {
-				fullName = input
-			}
-
-			if fullName != "" {
-				for _, existing := range existingIdentified {
-					existingName := ""
-					if en, ok := existing["full_name"].(string); ok {
-						existingName = en
-					}
-					if existingName == fullName && fullName != "себя" && fullName != "я" && fullName != "меня" {
-						isDuplicate = true
-						break
-					}
-				}
-			}
-		}
-
-		if isDuplicate {
-			// Формируем имя для сообщения о дубликате
-			displayName := ""
-			if nick, ok := p["telegram_nick"].(string); ok && nick != "" {
-				displayName = nick
-			} else if fn, ok := p["full_name"].(string); ok {
-				displayName = fn
-			} else if input, ok := p["input"].(string); ok {
-				displayName = input
-			}
-			duplicates = append(duplicates, displayName)
-		} else {
-			newPlayers = append(newPlayers, p)
-		}
-	}
-
-	// Если есть дубликаты, показываем сообщение
-	if len(duplicates) > 0 {
-		dupMsg := "⚠️ Следующие игроки уже были записаны ранее и не добавлены:\n"
-		for _, name := range duplicates {
-			dupMsg += fmt.Sprintf("• %s\n", name)
-		}
-		h.Bot.Send(tgbotapi.NewMessage(chatID, dupMsg))
-
-		// Если после удаления дубликатов не осталось новых игроков, выходим
-		if len(newPlayers) == 0 {
-			h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Новых участников не добавлено"))
-			h.showEventDetails(chatID, eventID, userID)
-			return
-		}
-
-		// Обновляем identifiedPlayers для дальнейшей обработки
-		identifiedPlayers = newPlayers
-		count = len(newPlayers)
-	}
-
-	// Формируем информацию об участниках
-	var participantsInfo string
-	var playerIDs []int64
-
-	var participantNames []string
-	for _, p := range identifiedPlayers {
-		// Получаем имя для отображения
-		displayName := ""
-		if fn, ok := p["full_name"].(string); ok && fn != "" {
-			displayName = fn
-		} else if input, ok := p["input"].(string); ok && input != "" {
-			displayName = input
-		} else {
-			displayName = "Неизвестно"
-		}
-
-		// Если есть player_id, добавляем ID
-		if pid, ok := p["player_id"].(int); ok && pid > 0 {
-			playerIDs = append(playerIDs, int64(pid))
-			participantNames = append(participantNames, fmt.Sprintf("%s (ID:%d)", displayName, pid))
-		} else {
-			participantNames = append(participantNames, displayName)
-		}
-	}
-	participantsInfo = strings.Join(participantNames, ", ")
-
-	// Сохраняем информацию об идентифицированных игроках в JSON
-	identifiedJSON, _ := json.Marshal(identifiedPlayers)
-
-	if err == nil && existingStatus == "registered" {
-		// Уже активная запись - обновляем, добавляя новых участников
-		log.Printf("🔄 Обновление существующей записи ID=%d", existingID)
-
-		// Объединяем существующих и новых участников
-		allIdentified := existingIdentified
-		allIdentified = append(allIdentified, identifiedPlayers...)
-
-		// Объединяем player_ids
-		var allPlayerIDs []int64
-		allPlayerIDs = append(allPlayerIDs, existingPlayerIDs...)
-		allPlayerIDs = append(allPlayerIDs, playerIDs...)
-
-		// Формируем новую информацию
-		var allNames []string
-		for _, p := range allIdentified {
-			displayName := ""
-			if fn, ok := p["full_name"].(string); ok && fn != "" {
-				displayName = fn
-			} else if input, ok := p["input"].(string); ok && input != "" {
-				displayName = input
-			} else {
-				displayName = "Неизвестно"
-			}
-
-			if pid, ok := p["player_id"].(int); ok && pid > 0 {
-				allNames = append(allNames, fmt.Sprintf("%s (ID:%d)", displayName, pid))
-			} else {
 				allNames = append(allNames, displayName)
 			}
-		}
-		newParticipantsInfo := strings.Join(allNames, ", ")
-		newCount := len(allIdentified)
-		updatedJSON, _ := json.Marshal(allIdentified)
+			newParticipantsInfo := strings.Join(allNames, ", ")
+			newCount := len(allIdentified)
+			updatedJSON, _ := json.Marshal(allIdentified)
 
-		_, err = tx.Exec(`
-			UPDATE person_event 
-			SET participants_count = $1,
-			    participants_info = $2,
-			    player_ids = $3,
-			    identification_data = $4,
-			    registered_at = NOW()
-			WHERE id = $5
-		`, newCount, newParticipantsInfo, pq.Array(allPlayerIDs), updatedJSON, existingID)
-
-		if err != nil {
-			log.Printf("❌ Ошибка обновления записи: %v", err)
-			h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка регистрации"))
-			return
-		}
-
-	} else if err == nil {
-		// Была отмененная запись - обновляем её
-		log.Printf("🔄 Обновление отмененной записи ID=%d", existingID)
-
-		_, err = tx.Exec(`
-			UPDATE person_event 
-			SET status = 'registered', 
-			    participants_count = $1, 
-			    registered_at = NOW(), 
-			    participants_info = $2,
-			    player_ids = $3,
-			    identification_data = $4
-			WHERE id = $5
-		`, count, participantsInfo, pq.Array(playerIDs), identifiedJSON, existingID)
-
-		if err != nil {
-			log.Printf("❌ Ошибка обновления записи: %v", err)
-			h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка регистрации"))
-			return
+			_, err = tx.Exec(`
+				UPDATE person_event 
+				SET participants_count = $1,
+				    participants_info = $2,
+				    identification_data = $3,
+				    registered_at = NOW()
+				WHERE id = $4
+			`, newCount, newParticipantsInfo, updatedJSON, existingID)
+		} else {
+			// Была отмененная запись - обновляем
+			_, err = tx.Exec(`
+				UPDATE person_event 
+				SET status = 'registered', 
+				    participants_count = $1, 
+				    registered_at = NOW(), 
+				    participants_info = $2,
+				    identification_data = $3
+				WHERE id = $4
+			`, count, "", identifiedJSON, existingID)
 		}
 	} else {
 		// Нет записи - создаем новую
-		log.Printf("🆕 Создание новой записи для пользователя %d на событие %d", dbPersonID, eventID)
+		var participantNames []string
+		for _, p := range identifiedPlayers {
+			displayName := p["full_name"].(string)
+			if nick, ok := p["telegram_nick"].(string); ok && nick != "" {
+				displayName = fmt.Sprintf("%s %s", nick, displayName)
+			}
+			participantNames = append(participantNames, displayName)
+		}
+		participantsInfo := strings.Join(participantNames, ", ")
 
 		_, err = tx.Exec(`
 			INSERT INTO person_event (
 				person_id, event_id, participants_count, 
-				participants_info, player_ids, identification_data,
+				participants_info, identification_data,
 				status, registered_at
 			)
-			VALUES ($1, $2, $3, $4, $5, $6, 'registered', NOW())
-		`, dbPersonID, eventID, count, participantsInfo, pq.Array(playerIDs), identifiedJSON)
+			VALUES ($1, $2, $3, $4, $5, 'registered', NOW())
+		`, dbPersonID, eventID, count, participantsInfo, identifiedJSON)
+	}
 
-		if err != nil {
-			log.Printf("❌ Ошибка регистрации: %v", err)
-			h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка регистрации"))
-			return
-		}
+	if err != nil {
+		log.Printf("❌ Ошибка сохранения: %v", err)
+		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка регистрации"))
+		return
 	}
 
 	// Подтверждаем транзакцию
@@ -1310,31 +1202,12 @@ func (h *CallbackHandler) registerForEventWithIdentification(chatID int64, event
 	successMsg += "📋 *Участники:*\n"
 
 	for i, p := range identifiedPlayers {
-		displayName := ""
-		if fn, ok := p["full_name"].(string); ok && fn != "" {
-			displayName = fn
-		} else if input, ok := p["input"].(string); ok && input != "" {
-			displayName = input
-		} else {
-			displayName = "Неизвестно"
-		}
-
-		// Добавляем ник если есть
-		nickPart := ""
+		displayName := p["full_name"].(string)
 		if nick, ok := p["telegram_nick"].(string); ok && nick != "" {
-			nickPart = fmt.Sprintf(" %s", nick)
+			displayName = fmt.Sprintf("%s %s", nick, displayName)
 		}
 
-		if pid, ok := p["player_id"].(int); ok && pid > 0 {
-			successMsg += fmt.Sprintf("%d. ✅ %s%s\n", i+1, escapeMarkdown(displayName), escapeMarkdown(nickPart))
-		} else {
-			successMsg += fmt.Sprintf("%d. ⚠️ %s%s\n", i+1, escapeMarkdown(displayName), escapeMarkdown(nickPart))
-		}
-	}
-
-	// Если были дубликаты, добавляем информацию
-	if len(duplicates) > 0 {
-		successMsg += "\n⚠️ Некоторые игроки не были добавлены, так как уже записаны ранее."
+		successMsg += fmt.Sprintf("%d. ⏳ %s\n", i+1, escapeMarkdown(displayName))
 	}
 
 	log.Printf("✅ Успешная регистрация на событие %d", eventID)
@@ -2136,12 +2009,18 @@ func (h *CallbackHandler) showEventDetails(chatID int64, eventID int, userID int
 	var participantsInfo sql.NullString
 	var existingPlayerIDs []int64
 	var identificationData []byte
+	var paymentStatus sql.NullString
+	var paymentDate sql.NullTime
 
 	err = database.DB.QueryRow(`
-		SELECT status, participants_count, participants_info, COALESCE(player_ids, ARRAY[]::INTEGER[]), COALESCE(identification_data, '[]'::JSONB)
+		SELECT status, participants_count, participants_info, 
+		       COALESCE(player_ids, ARRAY[]::INTEGER[]), 
+		       COALESCE(identification_data, '[]'::JSONB),
+		       payment_status, payment_date
 		FROM person_event 
 		WHERE person_id = $1 AND event_id = $2
-	`, dbPersonID, eventID).Scan(&registrationStatus, &participantsCount, &participantsInfo, pq.Array(&existingPlayerIDs), &identificationData)
+	`, dbPersonID, eventID).Scan(&registrationStatus, &participantsCount, &participantsInfo,
+		pq.Array(&existingPlayerIDs), &identificationData, &paymentStatus, &paymentDate)
 
 	if err == nil && registrationStatus == "registered" {
 		isRegistered = true
@@ -2158,6 +2037,15 @@ func (h *CallbackHandler) showEventDetails(chatID int64, eventID int, userID int
 		e.MemberLimit,
 		e.MemberLimit-e.Registered,
 	)
+
+	// Добавляем информацию о статусе оплаты для админа
+	if h.isAdmin(userID) && isRegistered {
+		if paymentStatus.Valid && paymentStatus.String == "paid" {
+			text += fmt.Sprintf("\n💰 *Оплачено:* %s", paymentDate.Time.Format("02.01.2006 15:04"))
+		} else if isRegistered {
+			text += "\n⏳ *Ожидает оплаты*"
+		}
+	}
 
 	var keyboard [][]tgbotapi.InlineKeyboardButton
 
@@ -2347,13 +2235,6 @@ func (h *CallbackHandler) handleAdminCallback(callback *tgbotapi.CallbackQuery, 
 		msgHandler := NewMessageHandler(h.Bot, h.AdminIDs, h.UserStates)
 		msgHandler.confirmDeleteCategory(chatID, categoryID)
 
-	case "view_registrations":
-		if len(data) < 3 {
-			return
-		}
-		eventID, _ := strconv.Atoi(data[2])
-		h.showEventRegistrations(chatID, eventID)
-
 	case "view_event_registrations":
 		if len(data) < 3 {
 			return
@@ -2437,6 +2318,70 @@ func (h *CallbackHandler) handleAdminCallback(callback *tgbotapi.CallbackQuery, 
 		msgHandler := NewMessageHandler(h.Bot, h.AdminIDs, h.UserStates)
 		msgHandler.showPlayersMenu(chatID)
 
+	// НОВЫЕ CASE ДЛЯ УПРАВЛЕНИЯ ОПЛАТАМИ
+	case "payment_menu":
+		msgHandler := NewMessageHandler(h.Bot, h.AdminIDs, h.UserStates)
+		msgHandler.showPaymentManagement(chatID)
+
+	case "payment_event":
+		if len(data) < 3 {
+			return
+		}
+		eventID, _ := strconv.Atoi(data[2])
+		msgHandler := NewMessageHandler(h.Bot, h.AdminIDs, h.UserStates)
+		msgHandler.showEventPayments(chatID, eventID)
+
+	case "all_unpaid":
+		msgHandler := NewMessageHandler(h.Bot, h.AdminIDs, h.UserStates)
+		msgHandler.showAllUnpaid(chatID)
+
+	case "mark_paid":
+		if len(data) < 3 {
+			return
+		}
+		personEventID, _ := strconv.Atoi(data[2])
+		msgHandler := NewMessageHandler(h.Bot, h.AdminIDs, h.UserStates)
+		msgHandler.markAsPaid(chatID, personEventID)
+		msgHandler.showPaymentManagement(chatID)
+
+	case "mark_participant_paid":
+		if len(data) < 3 {
+			return
+		}
+		participantKey := data[2]
+		msgHandler := NewMessageHandler(h.Bot, h.AdminIDs, h.UserStates)
+
+		// Получаем eventID из participantKey (формат: "peID_idx")
+		parts := strings.Split(participantKey, "_")
+		if len(parts) == 2 {
+			peID, _ := strconv.Atoi(parts[0])
+			// Получаем eventID по person_event_id
+			var evID int
+			_ = database.DB.QueryRow(`SELECT event_id FROM person_event WHERE id = $1`, peID).Scan(&evID)
+
+			msgHandler.markParticipantAsPaid(chatID, participantKey)
+			// Обновляем отображение с правильным eventID
+			if evID > 0 {
+				msgHandler.showEventPayments(chatID, evID)
+			} else {
+				msgHandler.showPaymentManagement(chatID)
+			}
+		}
+		return
+
+	case "mark_all_paid":
+		if len(data) < 3 {
+			return
+		}
+		eventID, _ := strconv.Atoi(data[2])
+		msgHandler := NewMessageHandler(h.Bot, h.AdminIDs, h.UserStates)
+		msgHandler.markAllAsPaid(chatID, eventID)
+		msgHandler.showEventPayments(chatID, eventID)
+
+	case "back_to_payments":
+		msgHandler := NewMessageHandler(h.Bot, h.AdminIDs, h.UserStates)
+		msgHandler.showPaymentManagement(chatID)
+
 	case "back":
 		delete(h.UserStates, userID)
 		msg := tgbotapi.NewMessage(chatID, "👑 Панель администратора:")
@@ -2462,6 +2407,7 @@ func (h *CallbackHandler) getAdminKeyboard() tgbotapi.ReplyKeyboardMarkup {
 		),
 		tgbotapi.NewKeyboardButtonRow(
 			tgbotapi.NewKeyboardButton("👥 Управление игроками"),
+			tgbotapi.NewKeyboardButton("💰 Управление оплатами"),
 		),
 	)
 	keyboard.ResizeKeyboard = true
@@ -2578,76 +2524,76 @@ func (h *CallbackHandler) deleteEvent(chatID int64, eventID int) {
 }
 
 // showEventRegistrations показывает записи на событие (для callback)
-func (h *CallbackHandler) showEventRegistrations(chatID int64, eventID int) {
-	rows, err := database.DB.Query(`
-		SELECT p.nikname, p.firstname, p.lastname, pe.participants_count, pe.participants_info, pe.registered_at
-		FROM person_event pe
-		JOIN person p ON pe.person_id = p.id
-		WHERE pe.event_id = $1 AND pe.status = 'registered'
-		ORDER BY pe.registered_at
-	`, eventID)
-
-	if err != nil {
-		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка загрузки"))
-		return
-	}
-	defer rows.Close()
-
-	var eventInfo struct {
-		Name     string
-		DateTime time.Time
-		Limit    int
-	}
-	database.DB.QueryRow(`
-		SELECT c.name, e.evn_datetime, e.member_limit
-		FROM event e
-		JOIN category c ON e.category_id = c.id
-		WHERE e.id = $1
-	`, eventID).Scan(&eventInfo.Name, &eventInfo.DateTime, &eventInfo.Limit)
-
-	text := fmt.Sprintf("📊 Записи на событие *%s*\n"+
-		"📅 %s\n"+
-		"👥 Лимит: %d\n\n",
-		eventInfo.Name,
-		eventInfo.DateTime.Format("02.01.2006 15:04"),
-		eventInfo.Limit,
-	)
-
-	count := 0
-	totalParticipants := 0
-	for rows.Next() {
-		count++
-		var nikname, first, last string
-		var participants int
-		var participantsInfo sql.NullString
-		var regTime time.Time
-		err := rows.Scan(&nikname, &first, &last, &participants, &participantsInfo, &regTime)
-		if err != nil {
-			log.Printf("❌ Ошибка сканирования: %v", err)
-			continue
-		}
-		totalParticipants += participants
-
-		userName := nikname
-		if first != "" {
-			userName = first + " " + last
-		}
-
-		text += fmt.Sprintf("%d. *%s* - %d чел.\n", count, userName, participants)
-		if participantsInfo.Valid && participantsInfo.String != "" && participantsInfo.String != fmt.Sprintf("%d человек", participants) {
-			text += fmt.Sprintf("   📋 %s\n", participantsInfo.String)
-		}
-		text += fmt.Sprintf("   📅 %s\n\n", regTime.Format("02.01 15:04"))
-	}
-
-	if count == 0 {
-		text += "\n❌ Нет записей"
-	} else {
-		text += fmt.Sprintf("\n📊 Всего записей: %d\n", count)
-		text += fmt.Sprintf("👥 Всего участников: %d\n", totalParticipants)
-	}
-
-	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ParseMode = "Markdown"
-	h.Bot.Send(msg)
-}
+//func (h *CallbackHandler) showEventRegistrations(chatID int64, eventID int) {
+//	rows, err := database.DB.Query(`
+//		SELECT p.nikname, p.firstname, p.lastname, pe.participants_count, pe.participants_info, pe.registered_at
+//		FROM person_event pe
+//		JOIN person p ON pe.person_id = p.id
+//		WHERE pe.event_id = $1 AND pe.status = 'registered'
+//		ORDER BY pe.registered_at
+//	`, eventID)
+//
+//	if err != nil {
+//		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка загрузки"))
+//		return
+//	}
+//	defer rows.Close()
+//
+//	var eventInfo struct {
+//		Name     string
+//		DateTime time.Time
+//		Limit    int
+//	}
+//	database.DB.QueryRow(`
+//		SELECT c.name, e.evn_datetime, e.member_limit
+//		FROM event e
+//		JOIN category c ON e.category_id = c.id
+//		WHERE e.id = $1
+//	`, eventID).Scan(&eventInfo.Name, &eventInfo.DateTime, &eventInfo.Limit)
+//
+//	text := fmt.Sprintf("📊 Записи на событие *%s*\n"+
+//		"📅 %s\n"+
+//		"👥 Лимит: %d\n\n",
+//		eventInfo.Name,
+//		eventInfo.DateTime.Format("02.01.2006 15:04"),
+//		eventInfo.Limit,
+//	)
+//
+//	count := 0
+//	totalParticipants := 0
+//	for rows.Next() {
+//		count++
+//		var nikname, first, last string
+//		var participants int
+//		var participantsInfo sql.NullString
+//		var regTime time.Time
+//		err := rows.Scan(&nikname, &first, &last, &participants, &participantsInfo, &regTime)
+//		if err != nil {
+//			log.Printf("❌ Ошибка сканирования: %v", err)
+//			continue
+//		}
+//		totalParticipants += participants
+//
+//		userName := nikname
+//		if first != "" {
+//			userName = first + " " + last
+//		}
+//
+//		text += fmt.Sprintf("%d. *%s* - %d чел.\n", count, userName, participants)
+//		if participantsInfo.Valid && participantsInfo.String != "" && participantsInfo.String != fmt.Sprintf("%d человек", participants) {
+//			text += fmt.Sprintf("   📋 %s\n", participantsInfo.String)
+//		}
+//		text += fmt.Sprintf("   📅 %s\n\n", regTime.Format("02.01 15:04"))
+//	}
+//
+//	if count == 0 {
+//		text += "\n❌ Нет записей"
+//	} else {
+//		text += fmt.Sprintf("\n📊 Всего записей: %d\n", count)
+//		text += fmt.Sprintf("👥 Всего участников: %d\n", totalParticipants)
+//	}
+//
+//	msg := tgbotapi.NewMessage(chatID, text)
+//	msg.ParseMode = "Markdown"
+//	h.Bot.Send(msg)
+//}
