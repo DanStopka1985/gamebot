@@ -24,15 +24,17 @@ func (h *CallbackHandler) askParticipantsCount(chatID int64, eventID int, userID
 	log.Printf("📊 Запрос количества для события %d", eventID)
 
 	var eventName string
+	var eventDateTime time.Time
 	err := database.DB.QueryRow(`
-		SELECT c.name 
+		SELECT c.name, e.evn_datetime
 		FROM event e
 		JOIN category c ON e.category_id = c.id
 		WHERE e.id = $1
-	`, eventID).Scan(&eventName)
+	`, eventID).Scan(&eventName, &eventDateTime)
 
 	if err != nil {
 		eventName = "Событие"
+		eventDateTime = time.Now()
 	}
 
 	var dbPersonID int
@@ -42,16 +44,18 @@ func (h *CallbackHandler) askParticipantsCount(chatID int64, eventID int, userID
 		return
 	}
 
-	var existing int
+	// Проверяем, есть ли уже активная запись
+	var existingID int
+	var existingStatus string
+	var participantsCount int
+	var identificationData []byte
 	err = database.DB.QueryRow(`
-		SELECT COUNT(*) FROM person_event 
-		WHERE person_id = $1 AND event_id = $2 AND status = 'registered'
-	`, dbPersonID, eventID).Scan(&existing)
+		SELECT id, status, participants_count, identification_data
+		FROM person_event 
+		WHERE person_id = $1 AND event_id = $2
+	`, dbPersonID, eventID).Scan(&existingID, &existingStatus, &participantsCount, &identificationData)
 
-	if err == nil && existing > 0 {
-		h.Bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("❌ Вы уже записаны на '%s'", eventName)))
-		return
-	}
+	hasExisting := (err == nil)
 
 	var registered, limit int
 	err = database.DB.QueryRow(`
@@ -71,6 +75,58 @@ func (h *CallbackHandler) askParticipantsCount(chatID int64, eventID int, userID
 	available := limit - registered
 	log.Printf("📊 Событие %d: занято %d, лимит %d, свободно %d", eventID, registered, limit, available)
 
+	// Если есть активная запись
+	if hasExisting && existingStatus == "registered" {
+		// Показываем информацию о текущей записи
+		text := fmt.Sprintf("📅 *%s* (%s %s)\n\n",
+			escapeMarkdown(eventName),
+			escapeMarkdown(eventDateTime.Format("02.01.2006")),
+			escapeMarkdown(eventDateTime.Format("15:04")))
+
+		text += "✅ *Вы уже записаны на это событие!*\n\n"
+
+		// Показываем текущих участников
+		if len(identificationData) > 0 {
+			var identified []map[string]interface{}
+			if err := json.Unmarshal(identificationData, &identified); err == nil {
+				text += fmt.Sprintf("📋 *Текущие участники (%d чел.):*\n", len(identified))
+				for i, id := range identified {
+					if pid, ok := id["player_id"].(float64); ok && pid > 0 {
+						text += fmt.Sprintf("  %d. ✅ %s\n", i+1, id["full_name"])
+					} else {
+						text += fmt.Sprintf("  %d. ⚠️ %s\n", i+1, id["full_name"])
+					}
+				}
+			}
+		} else {
+			text += fmt.Sprintf("👥 *Количество:* %d чел.\n", participantsCount)
+		}
+
+		text += fmt.Sprintf("\n📊 *Свободно мест:* %d\n", available)
+
+		// Предлагаем варианты
+		var rows [][]tgbotapi.InlineKeyboardButton
+
+		if available > 0 {
+			rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("➕ Добавить еще участников", fmt.Sprintf("add_more:%d", eventID)),
+			))
+		}
+
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("❌ Отменить запись", fmt.Sprintf("cancel_reg:%d", eventID)),
+		))
+
+		keyboard := tgbotapi.NewInlineKeyboardMarkup(rows...)
+
+		msg := tgbotapi.NewMessage(chatID, text)
+		msg.ParseMode = "Markdown"
+		msg.ReplyMarkup = keyboard
+		h.Bot.Send(msg)
+		return
+	}
+
+	// Если нет записи - обычный процесс регистрации
 	if available <= 0 {
 		h.Bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("❌ На '%s' свободных мест нет", eventName)))
 		return
@@ -94,7 +150,11 @@ func (h *CallbackHandler) askParticipantsCount(chatID int64, eventID int, userID
 
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(rows...)
 
-	msgText := fmt.Sprintf("📅 *%s*\nСвободно мест: %d\n\nВыберите количество участников:", eventName, available)
+	msgText := fmt.Sprintf("📅 *%s* (%s %s)\nСвободно мест: %d\n\nВыберите количество участников:",
+		escapeMarkdown(eventName),
+		escapeMarkdown(eventDateTime.Format("02.01.2006")),
+		escapeMarkdown(eventDateTime.Format("15:04")),
+		available)
 	msg := tgbotapi.NewMessage(chatID, msgText)
 	msg.ParseMode = "Markdown"
 	msg.ReplyMarkup = keyboard
