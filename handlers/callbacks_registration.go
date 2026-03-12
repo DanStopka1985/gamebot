@@ -512,23 +512,46 @@ func (h *CallbackHandler) showEventDetails(chatID int64, eventID int, userID int
 	var dbPersonID int
 	database.DB.QueryRow(`SELECT id FROM person WHERE telegram_id = $1`, userID).Scan(&dbPersonID)
 
+	var existingID int
 	var registrationStatus string
 	var participantsCount int
-	var participantsInfo sql.NullString
-	var identificationData []byte
+	var paymentStatus string
+
 	err = database.DB.QueryRow(`
-		SELECT status, participants_count, participants_info, identification_data 
+		SELECT id, status, participants_count, COALESCE(payment_status, 'pending')
 		FROM person_event 
 		WHERE person_id = $1 AND event_id = $2
-	`, dbPersonID, eventID).Scan(&registrationStatus, &participantsCount, &participantsInfo, &identificationData)
+	`, dbPersonID, eventID).Scan(&existingID, &registrationStatus, &participantsCount, &paymentStatus)
 
 	isRegistered := (err == nil && registrationStatus == "registered")
 
+	// Получаем ВСЕХ участников события из всех записей
+	rows, err := database.DB.Query(`
+		SELECT 
+			pe.id as person_event_id,
+			p.nikname,
+			p.firstname,
+			p.lastname,
+			pe.identification_data,
+			pe.payment_status
+		FROM person_event pe
+		JOIN person p ON pe.person_id = p.id
+		WHERE pe.event_id = $1 AND pe.status = 'registered'
+		ORDER BY pe.registered_at
+	`, eventID)
+
+	if err != nil {
+		log.Printf("❌ Ошибка загрузки участников: %v", err)
+	} else {
+		defer rows.Close()
+	}
+
+	// Формируем заголовок
 	text := fmt.Sprintf(
 		"📅 *%s*\n\n"+
 			"📆 Дата: %s\n"+
-			"👥 Записано: %d/%d\n"+
-			"📊 Свободно: %d\n",
+			"👥 Всего записано: %d/%d\n"+
+			"📊 Свободно: %d\n\n",
 		e.CategoryName,
 		e.DateTime.Format("02.01.2006 15:04"),
 		e.Registered,
@@ -536,25 +559,76 @@ func (h *CallbackHandler) showEventDetails(chatID int64, eventID int, userID int
 		e.MemberLimit-e.Registered,
 	)
 
+	// Если у пользователя есть запись, показываем его статус
 	if isRegistered {
-		text += fmt.Sprintf("\n✅ Вы записаны!")
+		paymentEmoji := "⏳"
+		if paymentStatus == "paid" {
+			paymentEmoji = "💰"
+		}
+		text += fmt.Sprintf("%s *Ваша запись:* %d чел.\n", paymentEmoji, participantsCount)
+	}
+
+	// Показываем ВСЕХ участников по группам (кто записал)
+	text += "\n📋 *Все участники:*\n\n"
+
+	participantIndex := 1
+	for rows.Next() {
+		var peID int
+		var nikname, firstname, lastname string
+		var identificationData []byte
+		var pePaymentStatus string
+
+		err := rows.Scan(&peID, &nikname, &firstname, &lastname, &identificationData, &pePaymentStatus)
+		if err != nil {
+			log.Printf("❌ Ошибка сканирования: %v", err)
+			continue
+		}
+
+		// Кто записал
+		registrantName := ""
+		if nikname != "" {
+			registrantName = "@" + nikname
+		}
+		if firstname != "" || lastname != "" {
+			if registrantName != "" {
+				registrantName += " "
+			}
+			registrantName += firstname + " " + lastname
+		}
+		if registrantName == "" {
+			registrantName = fmt.Sprintf("ID: %d", peID)
+		}
+
+		text += fmt.Sprintf("👤 *Записал:* %s\n", registrantName)
+
+		// Получаем участников из identification_data
 		if len(identificationData) > 0 {
 			var identified []map[string]interface{}
 			if err := json.Unmarshal(identificationData, &identified); err == nil {
-				text += fmt.Sprintf("\n📋 Участники: %d человек\n", len(identified))
-				for i, id := range identified {
-					if pid, ok := id["player_id"].(float64); ok && pid > 0 {
-						text += fmt.Sprintf("  %d. ✅ %s\n", i+1, id["full_name"])
-					} else {
-						text += fmt.Sprintf("  %d. ⚠️ %s\n", i+1, id["full_name"])
+				for _, participant := range identified {
+					// Иконка идентификации
+					idIcon := "⚠️"
+					if pid, ok := participant["player_id"].(float64); ok && pid > 0 {
+						idIcon = "✅"
 					}
+
+					// Иконка оплаты
+					payIcon := "⏳"
+					if pePaymentStatus == "paid" {
+						payIcon = "💰"
+					}
+
+					fullName := "Неизвестно"
+					if fn, ok := participant["full_name"].(string); ok {
+						fullName = fn
+					}
+
+					text += fmt.Sprintf("  %d. %s %s %s\n", participantIndex, idIcon, payIcon, fullName)
+					participantIndex++
 				}
 			}
-		} else if participantsInfo.Valid && participantsInfo.String != "" {
-			text += fmt.Sprintf("\n📋 %s\n", participantsInfo.String)
-		} else {
-			text += fmt.Sprintf("\n👥 Количество: %d", participantsCount)
 		}
+		text += "\n"
 	}
 
 	var keyboard tgbotapi.InlineKeyboardMarkup
@@ -564,6 +638,9 @@ func (h *CallbackHandler) showEventDetails(chatID int64, eventID int, userID int
 			tgbotapi.NewInlineKeyboardRow(
 				tgbotapi.NewInlineKeyboardButtonData("❌ Отменить запись", fmt.Sprintf("cancel_reg:%d", eventID)),
 				tgbotapi.NewInlineKeyboardButtonData("➕ Добавить еще", fmt.Sprintf("add_more:%d", eventID)),
+			),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("💰 Отметить оплату", fmt.Sprintf("payment_mark:%d", eventID)),
 			),
 		)
 	} else if e.Registered < e.MemberLimit {
