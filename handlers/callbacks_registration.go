@@ -524,6 +524,7 @@ func (h *CallbackHandler) showEventDetails(chatID int64, eventID int, userID int
 	`, dbPersonID, eventID).Scan(&existingID, &registrationStatus, &participantsCount, &paymentStatus)
 
 	isRegistered := (err == nil && registrationStatus == "registered")
+	isAdmin := h.isAdmin(userID)
 
 	// Получаем ВСЕХ участников события из всех записей
 	rows, err := database.DB.Query(`
@@ -632,22 +633,46 @@ func (h *CallbackHandler) showEventDetails(chatID int64, eventID int, userID int
 	}
 
 	var keyboard tgbotapi.InlineKeyboardMarkup
+
 	if isRegistered {
-		// Если пользователь уже записан - показываем кнопки отмены и дозаписи
-		keyboard = tgbotapi.NewInlineKeyboardMarkup(
-			tgbotapi.NewInlineKeyboardRow(
+		// Для обычных пользователей с записью - только отмена и дозапись
+		buttons := [][]tgbotapi.InlineKeyboardButton{
+			{
 				tgbotapi.NewInlineKeyboardButtonData("❌ Отменить запись", fmt.Sprintf("cancel_reg:%d", eventID)),
 				tgbotapi.NewInlineKeyboardButtonData("➕ Добавить еще", fmt.Sprintf("add_more:%d", eventID)),
-			),
-			tgbotapi.NewInlineKeyboardRow(
-				tgbotapi.NewInlineKeyboardButtonData("💰 Отметить оплату", fmt.Sprintf("payment_mark:%d", eventID)),
-			),
-		)
+			},
+		}
+
+		// Для админов добавляем кнопку оплаты
+		if isAdmin {
+			buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("💰 Управление оплатами", fmt.Sprintf("admin:payment_event:%d", eventID)),
+			))
+		}
+
+		keyboard = tgbotapi.NewInlineKeyboardMarkup(buttons...)
+
 	} else if e.Registered < e.MemberLimit {
-		// Если есть свободные места и пользователь не записан - показываем кнопку записи
+		// Если есть свободные места и пользователь не записан
+		buttons := [][]tgbotapi.InlineKeyboardButton{
+			{
+				tgbotapi.NewInlineKeyboardButtonData("✅ Записаться", fmt.Sprintf("register:%d", eventID)),
+			},
+		}
+
+		// Для админов даже без записи можно добавить кнопку оплаты
+		if isAdmin {
+			buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("💰 Управление оплатами", fmt.Sprintf("admin:payment_event:%d", eventID)),
+			))
+		}
+
+		keyboard = tgbotapi.NewInlineKeyboardMarkup(buttons...)
+	} else if isAdmin {
+		// Если мест нет, но пользователь админ - показываем только кнопку оплаты
 		keyboard = tgbotapi.NewInlineKeyboardMarkup(
 			tgbotapi.NewInlineKeyboardRow(
-				tgbotapi.NewInlineKeyboardButtonData("✅ Записаться", fmt.Sprintf("register:%d", eventID)),
+				tgbotapi.NewInlineKeyboardButtonData("💰 Управление оплатами", fmt.Sprintf("admin:payment_event:%d", eventID)),
 			),
 		)
 	}
