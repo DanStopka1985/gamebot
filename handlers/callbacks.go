@@ -57,8 +57,8 @@ func escapeMarkdown(text string) string {
 		"|", "\\|",
 		"{", "\\{",
 		"}", "\\}",
-		".", "\\.",
 		"!", "\\!",
+		// "." убрали из экранирования
 	)
 	return replacer.Replace(text)
 }
