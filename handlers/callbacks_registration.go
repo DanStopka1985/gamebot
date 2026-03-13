@@ -325,6 +325,11 @@ func (h *CallbackHandler) registerForEventWithIdentification(chatID int64, event
 
 	var participantNames []string
 	for _, p := range identifiedPlayers {
+		// Добавляем payment_status по умолчанию
+		if _, ok := p["payment_status"]; !ok {
+			p["payment_status"] = "pending"
+		}
+
 		if pid, ok := p["player_id"].(int); ok && pid > 0 {
 			playerIDs = append(playerIDs, int64(pid))
 			participantNames = append(participantNames, fmt.Sprintf("%s (ID:%d)", p["full_name"], pid))
@@ -336,6 +341,8 @@ func (h *CallbackHandler) registerForEventWithIdentification(chatID int64, event
 
 	// Сохраняем информацию об идентифицированных игроках в JSON
 	identifiedJSON, _ := json.Marshal(identifiedPlayers)
+
+	var personEventID int
 
 	if err == nil {
 		// Запись уже существует
@@ -363,19 +370,21 @@ func (h *CallbackHandler) registerForEventWithIdentification(chatID int64, event
 				h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка регистрации"))
 				return
 			}
+			personEventID = existingID
 		}
 	} else {
 		// Нет записи - создаем новую
 		log.Printf("🆕 Создание новой записи для пользователя %d на событие %d", dbPersonID, eventID)
 
-		_, err = tx.Exec(`
+		err = tx.QueryRow(`
 			INSERT INTO person_event (
 				person_id, event_id, participants_count, 
 				participants_info, player_ids, identification_data,
 				status, registered_at
 			)
 			VALUES ($1, $2, $3, $4, $5, $6, 'registered', NOW())
-		`, dbPersonID, eventID, count, participantsInfo, pq.Array(playerIDs), identifiedJSON)
+			RETURNING id
+		`, dbPersonID, eventID, count, participantsInfo, pq.Array(playerIDs), identifiedJSON).Scan(&personEventID)
 
 		if err != nil {
 			log.Printf("❌ Ошибка регистрации: %v", err)
@@ -419,8 +428,22 @@ func (h *CallbackHandler) registerForEventWithIdentification(chatID int64, event
 	msgObj.ParseMode = "Markdown"
 	h.Bot.Send(msgObj)
 
-	// Показываем обновленные детали события
-	h.showEventDetails(chatID, eventID, userID)
+	// Сохраняем состояние для напоминания
+	h.UserStates[userID] = &models.UserState{
+		Action: "asking_reminder",
+		Step:   "awaiting_choice",
+		TempData: map[string]interface{}{
+			"event_id":        eventID,
+			"person_event_id": personEventID,
+			"event_name":      eventName,
+			"event_datetime":  eventDateTime,
+		},
+	}
+
+	log.Printf("🔔 Состояние сохранено для пользователя %d: Action=%s", userID, h.UserStates[userID].Action)
+
+	// Спрашиваем о напоминании
+	h.askAboutReminder(chatID, eventID, userID, personEventID)
 }
 
 // cancelRegistration отменяет регистрацию
@@ -464,8 +487,24 @@ func (h *CallbackHandler) cancelRegistration(chatID int64, eventID int, userID i
 		return
 	}
 
+	// Начинаем транзакцию
+	tx, err := database.DB.Begin()
+	if err != nil {
+		log.Printf("❌ Ошибка начала транзакции: %v", err)
+		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка сервера"))
+		return
+	}
+	defer tx.Rollback()
+
+	// Удаляем напоминания для этой записи
+	_, err = tx.Exec(`DELETE FROM reminders WHERE person_event_id = $1`, existingID)
+	if err != nil {
+		log.Printf("⚠️ Ошибка удаления напоминания: %v", err)
+		// Продолжаем, даже если не удалили напоминание
+	}
+
 	// Обновляем статус записи на 'cancelled'
-	result, err := database.DB.Exec(`
+	result, err := tx.Exec(`
 		UPDATE person_event SET status = 'cancelled' 
 		WHERE id = $1 AND status = 'registered'
 	`, existingID)
@@ -479,18 +518,26 @@ func (h *CallbackHandler) cancelRegistration(chatID int64, eventID int, userID i
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
 		h.Bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("❌ Не удалось отменить запись на '%s'", eventName)))
-	} else {
-		cancelMsg := fmt.Sprintf("✅ Запись на '%s' отменена!", eventName)
-		if participantsInfo.Valid && participantsInfo.String != "" && participantsInfo.String != fmt.Sprintf("%d человек", participantsCount) {
-			cancelMsg += fmt.Sprintf("\n\nБыли записаны:\n%s", participantsInfo.String)
-		} else {
-			cancelMsg += fmt.Sprintf("\n\nБыло записано: %d чел.", participantsCount)
-		}
-		h.Bot.Send(tgbotapi.NewMessage(chatID, cancelMsg))
-
-		// После отмены показываем обновленную информацию о событии
-		h.showEventDetails(chatID, eventID, userID)
+		return
 	}
+
+	// Подтверждаем транзакцию
+	if err = tx.Commit(); err != nil {
+		log.Printf("❌ Ошибка сохранения: %v", err)
+		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка сохранения"))
+		return
+	}
+
+	cancelMsg := fmt.Sprintf("✅ Запись на '%s' отменена!", eventName)
+	if participantsInfo.Valid && participantsInfo.String != "" && participantsInfo.String != fmt.Sprintf("%d человек", participantsCount) {
+		cancelMsg += fmt.Sprintf("\n\nБыли записаны:\n%s", participantsInfo.String)
+	} else {
+		cancelMsg += fmt.Sprintf("\n\nБыло записано: %d чел.", participantsCount)
+	}
+	h.Bot.Send(tgbotapi.NewMessage(chatID, cancelMsg))
+
+	// После отмены показываем обновленную информацию о событии
+	h.showEventDetails(chatID, eventID, userID)
 }
 
 // showEventDetails показывает детали события
@@ -558,6 +605,15 @@ func (h *CallbackHandler) showEventDetails(chatID int64, eventID int, userID int
 	}
 	defer rows.Close()
 
+	// Конвертируем время в локальный часовой пояс (Москва, UTC+3)
+	loc, err := time.LoadLocation("Europe/Moscow")
+	if err != nil {
+		// Если не удалось загрузить часовой пояс, используем фиксированное смещение
+		loc = time.FixedZone("UTC+3", 3*60*60)
+	}
+
+	localDateTime := e.DateTime.In(loc)
+
 	// Формируем заголовок
 	text := fmt.Sprintf(
 		"📅 *%s*\n\n"+
@@ -565,7 +621,7 @@ func (h *CallbackHandler) showEventDetails(chatID int64, eventID int, userID int
 			"👥 Всего записано: %d/%d\n"+
 			"📊 Свободно: %d\n\n",
 		e.CategoryName,
-		e.DateTime.Format("02.01.2006 15:04"),
+		localDateTime.Format("02.01.2006 15:04"),
 		e.Registered,
 		e.MemberLimit,
 		e.MemberLimit-e.Registered,

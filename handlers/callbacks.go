@@ -272,6 +272,12 @@ func (h *CallbackHandler) HandleCallback(callback *tgbotapi.CallbackQuery) {
 		h.cancelParticipant(chatID, eventID, userID, index)
 		return
 
+		// В функции HandleCallback, в switch data[0] добавьте:
+
+	case "reminder_yes", "reminder_no":
+		h.handleReminderChoice(callback, data)
+		return
+
 	default:
 		log.Printf("❌ Неизвестная команда: %s", data[0])
 		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Неизвестная команда"))

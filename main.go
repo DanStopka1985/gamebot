@@ -89,6 +89,10 @@ func main() {
 	log.Printf("   - MessageHandler: %v", msgHandler != nil)
 	log.Printf("   - CallbackHandler: %v", callbackHandler != nil)
 
+	// Запускаем горутину для проверки напоминаний
+	go callbackHandler.StartReminderChecker()
+	log.Println("🔔 Проверка напоминаний запущена")
+
 	// Проверка и удаление webhook если есть
 	log.Println("🔄 Проверка наличия webhook...")
 	webhookInfo, err := bot.GetWebhookInfo()
@@ -107,7 +111,7 @@ func main() {
 		log.Println("✅ Webhook не обнаружен, используем long polling")
 	}
 
-	// Настройка обновлений
+	// Настройка обновлений с правильными параметрами
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 	u.AllowedUpdates = []string{"message", "callback_query", "channel_post", "my_chat_member", "chat_member"}
