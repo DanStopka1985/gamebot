@@ -641,12 +641,6 @@ func (h *CallbackHandler) showEventDetails(chatID int64, eventID int, userID int
 			log.Printf("📊 Найдено %d участников в записи %d", len(identified), peID)
 
 			for _, participant := range identified {
-				// Иконка идентификации
-				idIcon := "⚠️"
-				if pid, ok := participant["player_id"].(float64); ok && pid > 0 {
-					idIcon = "✅"
-				}
-
 				// Получаем имя участника
 				fullName := "Неизвестно"
 				if fn, ok := participant["full_name"].(string); ok && fn != "" {
@@ -655,13 +649,24 @@ func (h *CallbackHandler) showEventDetails(chatID int64, eventID int, userID int
 					fullName = input
 				}
 
-				// Получаем статус оплаты из participant
+				// Получаем статус оплаты из participant (доступно всем)
 				payIcon := "⏳"
 				if pStatus, ok := participant["payment_status"].(string); ok && pStatus == "paid" {
 					payIcon = "💰"
 				}
 
-				text += fmt.Sprintf("  %d. %s %s %s\n", participantIndex, idIcon, payIcon, fullName)
+				// Для админов добавляем иконку идентификации, для обычных пользователей - только имя
+				if isAdmin {
+					// Иконка идентификации только для админов
+					idIcon := "⚠️"
+					if pid, ok := participant["player_id"].(float64); ok && pid > 0 {
+						idIcon = "✅"
+					}
+					text += fmt.Sprintf("  %d. %s %s %s\n", participantIndex, idIcon, payIcon, fullName)
+				} else {
+					// Для обычных пользователей только иконка оплаты и имя
+					text += fmt.Sprintf("  %d. %s %s\n", participantIndex, payIcon, fullName)
+				}
 				participantIndex++
 			}
 		} else {
