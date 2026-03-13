@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -114,7 +115,7 @@ func (h *CallbackHandler) askParticipantsCount(chatID int64, eventID int, userID
 		}
 
 		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("❌ Отменить запись", fmt.Sprintf("cancel_reg:%d", eventID)),
+			tgbotapi.NewInlineKeyboardButtonData("❌ Отменить участников", fmt.Sprintf("cancel_choose:%d", eventID)),
 		))
 
 		keyboard := tgbotapi.NewInlineKeyboardMarkup(rows...)
@@ -674,10 +675,10 @@ func (h *CallbackHandler) showEventDetails(chatID int64, eventID int, userID int
 	var keyboard tgbotapi.InlineKeyboardMarkup
 
 	if isRegistered {
-		// Для обычных пользователей с записью - только отмена и дозапись
+		// Для пользователей с записью - отмена с выбором и дозапись
 		buttons := [][]tgbotapi.InlineKeyboardButton{
 			{
-				tgbotapi.NewInlineKeyboardButtonData("❌ Отменить запись", fmt.Sprintf("cancel_reg:%d", eventID)),
+				tgbotapi.NewInlineKeyboardButtonData("❌ Отменить участников", fmt.Sprintf("cancel_choose:%d", eventID)),
 				tgbotapi.NewInlineKeyboardButtonData("➕ Добавить еще", fmt.Sprintf("add_more:%d", eventID)),
 			},
 		}
@@ -722,4 +723,410 @@ func (h *CallbackHandler) showEventDetails(chatID int64, eventID int, userID int
 	h.Bot.Send(msg)
 
 	log.Printf("✅ showEventDetails завершена для события %d", eventID)
+}
+
+// askCancelParticipants запрашивает выбор участников для отмены
+func (h *CallbackHandler) askCancelParticipants(chatID int64, eventID int, userID int64) {
+	log.Printf("❓ Запрос выбора участников для отмены, событие %d", eventID)
+
+	// Получаем запись пользователя
+	var dbPersonID int
+	database.DB.QueryRow(`SELECT id FROM person WHERE telegram_id = $1`, userID).Scan(&dbPersonID)
+
+	var existingID int
+	var identificationData []byte
+	var participantsCount int
+
+	err := database.DB.QueryRow(`
+		SELECT id, participants_count, identification_data
+		FROM person_event 
+		WHERE person_id = $1 AND event_id = $2 AND status = 'registered'
+	`, dbPersonID, eventID).Scan(&existingID, &participantsCount, &identificationData)
+
+	if err != nil {
+		log.Printf("❌ Запись не найдена: %v", err)
+		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Активная запись не найдена"))
+		return
+	}
+
+	// Сохраняем состояние
+	h.UserStates[userID] = &models.UserState{
+		Action: "cancelling_participants",
+		Step:   "selecting",
+		TempData: map[string]interface{}{
+			"event_id":        eventID,
+			"person_event_id": existingID,
+			"participants":    participantsCount,
+		},
+	}
+
+	// Парсим участников
+	var participants []map[string]interface{}
+	if len(identificationData) > 0 {
+		json.Unmarshal(identificationData, &participants)
+	}
+
+	if len(participants) == 0 {
+		// Если нет данных, просто отменяем всю запись
+		h.cancelRegistration(chatID, eventID, userID)
+		return
+	}
+
+	// Показываем список участников
+	text := fmt.Sprintf("❌ *Отмена записи*\n\nНажмите на участника, чтобы отменить его:\n\n")
+
+	for i, p := range participants {
+		// Иконка идентификации
+		idIcon := "⚠️"
+		if pid, ok := p["player_id"].(float64); ok && pid > 0 {
+			idIcon = "✅"
+		}
+
+		// Имя участника
+		fullName := "Неизвестно"
+		if fn, ok := p["full_name"].(string); ok && fn != "" {
+			fullName = fn
+		} else if input, ok := p["input"].(string); ok && input != "" {
+			fullName = input
+		}
+
+		text += fmt.Sprintf("%d. %s %s\n", i+1, idIcon, fullName)
+	}
+
+	// Создаем кнопки для каждого участника
+	var buttons [][]tgbotapi.InlineKeyboardButton
+	for i, p := range participants {
+		// Иконка идентификации
+		idIcon := "⚠️"
+		if pid, ok := p["player_id"].(float64); ok && pid > 0 {
+			idIcon = "✅"
+		}
+
+		// Имя участника
+		fullName := "Неизвестно"
+		if fn, ok := p["full_name"].(string); ok && fn != "" {
+			fullName = fn
+		} else if input, ok := p["input"].(string); ok && input != "" {
+			fullName = input
+		}
+
+		buttonText := fmt.Sprintf("❌ %s %s", idIcon, fullName)
+		if len(buttonText) > 40 {
+			runes := []rune(buttonText)
+			if len(runes) > 40 {
+				buttonText = string(runes[:37]) + "..."
+			}
+		}
+
+		buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(
+				buttonText,
+				fmt.Sprintf("cancel_participant:%d:%d", eventID, i),
+			),
+		))
+	}
+
+	// Добавляем кнопку "Отменить всё" и "Назад"
+	buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("❌ Отменить всё", fmt.Sprintf("cancel_all:%d", eventID)),
+	))
+	buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("🔙 Назад", fmt.Sprintf("event:%d", eventID)),
+	))
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(buttons...)
+
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = "Markdown"
+	msg.ReplyMarkup = keyboard
+	h.Bot.Send(msg)
+}
+
+// cancelParticipant мгновенно отменяет одного участника
+func (h *CallbackHandler) cancelParticipant(chatID int64, eventID int, userID int64, participantIndex int) {
+	log.Printf("❌ Мгновенная отмена участника %d для события %d", participantIndex, eventID)
+
+	// Получаем запись пользователя
+	var dbPersonID int
+	database.DB.QueryRow(`SELECT id FROM person WHERE telegram_id = $1`, userID).Scan(&dbPersonID)
+
+	var existingID int
+	var identificationData []byte
+
+	err := database.DB.QueryRow(`
+		SELECT id, identification_data
+		FROM person_event 
+		WHERE person_id = $1 AND event_id = $2 AND status = 'registered'
+	`, dbPersonID, eventID).Scan(&existingID, &identificationData)
+
+	if err != nil {
+		log.Printf("❌ Запись не найдена: %v", err)
+		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Активная запись не найдена"))
+		return
+	}
+
+	// Парсим участников
+	var participants []map[string]interface{}
+	if len(identificationData) > 0 {
+		json.Unmarshal(identificationData, &participants)
+	}
+
+	if participantIndex < 0 || participantIndex >= len(participants) {
+		log.Printf("❌ Неверный индекс участника: %d", participantIndex)
+		return
+	}
+
+	// Запоминаем имя удаляемого участника для сообщения
+	deletedName := "Неизвестно"
+	if fn, ok := participants[participantIndex]["full_name"].(string); ok && fn != "" {
+		deletedName = fn
+	} else if input, ok := participants[participantIndex]["input"].(string); ok && input != "" {
+		deletedName = input
+	}
+
+	// Удаляем участника
+	newParticipants := append(participants[:participantIndex], participants[participantIndex+1:]...)
+	newCount := len(newParticipants)
+
+	if newCount == 0 {
+		// Если никого не осталось - полностью отменяем запись
+		h.cancelRegistration(chatID, eventID, userID)
+		return
+	}
+
+	// Обновляем запись
+	newData, _ := json.Marshal(newParticipants)
+	_, err = database.DB.Exec(`
+		UPDATE person_event 
+		SET participants_count = $1,
+		    identification_data = $2
+		WHERE id = $3
+	`, newCount, newData, existingID)
+
+	if err != nil {
+		log.Printf("❌ Ошибка обновления записи: %v", err)
+		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка при отмене"))
+		return
+	}
+
+	// Отправляем подтверждение
+	h.Bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ Участник '%s' отменен", deletedName)))
+
+	// Показываем обновленные детали
+	h.showEventDetails(chatID, eventID, userID)
+}
+
+// handleCancelSelection обрабатывает выбор участников для отмены
+func (h *CallbackHandler) handleCancelSelection(callback *tgbotapi.CallbackQuery, data []string) {
+	if len(data) < 3 {
+		return
+	}
+
+	eventID, _ := strconv.Atoi(data[1])
+	index, _ := strconv.Atoi(data[2])
+	userID := callback.From.ID
+	chatID := callback.Message.Chat.ID
+	messageID := callback.Message.MessageID
+
+	state, exists := h.UserStates[userID]
+	if !exists || state.Action != "cancelling_participants" {
+		return
+	}
+
+	selected := state.TempData["selected"].([]int)
+
+	// Проверяем, уже выбран ли этот участник
+	alreadySelected := false
+	for _, idx := range selected {
+		if idx == index {
+			alreadySelected = true
+			break
+		}
+	}
+
+	if alreadySelected {
+		// Убираем из выбранных
+		newSelected := []int{}
+		for _, idx := range selected {
+			if idx != index {
+				newSelected = append(newSelected, idx)
+			}
+		}
+		state.TempData["selected"] = newSelected
+	} else {
+		// Добавляем в выбранные
+		state.TempData["selected"] = append(selected, index)
+	}
+
+	// Обновляем сообщение - теперь передаем все 4 параметра
+	h.updateCancelSelectionMessage(chatID, userID, eventID, messageID)
+}
+
+// updateCancelSelectionMessage обновляет сообщение с выбором
+func (h *CallbackHandler) updateCancelSelectionMessage(chatID int64, userID int64, eventID int, messageID int) {
+	state, exists := h.UserStates[userID]
+	if !exists {
+		return
+	}
+
+	// Получаем данные записи
+	var identificationData []byte
+	database.DB.QueryRow(`
+		SELECT identification_data
+		FROM person_event 
+		WHERE id = $1
+	`, state.TempData["person_event_id"]).Scan(&identificationData)
+
+	var participants []map[string]interface{}
+	if len(identificationData) > 0 {
+		json.Unmarshal(identificationData, &participants)
+	}
+
+	selected := state.TempData["selected"].([]int)
+
+	text := fmt.Sprintf("❌ *Отмена записи*\n\nВыберите участников для отмены (выбрано %d):\n\n", len(selected))
+
+	var buttons [][]tgbotapi.InlineKeyboardButton
+
+	for i, p := range participants {
+		// Иконка идентификации
+		idIcon := "⚠️"
+		if pid, ok := p["player_id"].(float64); ok && pid > 0 {
+			idIcon = "✅"
+		}
+
+		// Имя участника
+		fullName := "Неизвестно"
+		if fn, ok := p["full_name"].(string); ok && fn != "" {
+			fullName = fn
+		} else if input, ok := p["input"].(string); ok && input != "" {
+			fullName = input
+		}
+
+		// Отмечаем выбранные
+		checkMark := " "
+		for _, idx := range selected {
+			if idx == i {
+				checkMark = "✅"
+				break
+			}
+		}
+
+		text += fmt.Sprintf("%d. %s %s %s\n", i+1, checkMark, idIcon, fullName)
+
+		// Кнопка для выбора
+		buttonText := fmt.Sprintf("%s Участник %d", checkMark, i+1)
+		buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(
+				buttonText,
+				fmt.Sprintf("cancel_select:%d:%d", eventID, i),
+			),
+		))
+	}
+
+	// Добавляем кнопки действий
+	buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("✅ Отменить выбранных", fmt.Sprintf("cancel_selected:%d", eventID)),
+	))
+	buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("❌ Отменить всё", fmt.Sprintf("cancel_all:%d", eventID)),
+	))
+	buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("🔙 Назад", fmt.Sprintf("event:%d", eventID)),
+	))
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(buttons...)
+
+	// Редактируем сообщение
+	editMsg := tgbotapi.NewEditMessageText(chatID, messageID, text)
+	editMsg.ParseMode = "Markdown"
+	editMsg.ReplyMarkup = &keyboard
+	h.Bot.Send(editMsg)
+}
+
+// cancelSelectedParticipants отменяет выбранных участников
+func (h *CallbackHandler) cancelSelectedParticipants(chatID int64, eventID int, userID int64) {
+	state, exists := h.UserStates[userID]
+	if !exists || state.Action != "cancelling_participants" {
+		return
+	}
+
+	selected := state.TempData["selected"].([]int)
+	if len(selected) == 0 {
+		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Никто не выбран"))
+		return
+	}
+
+	// Получаем данные записи
+	var personEventID int
+	var identificationData []byte
+	database.DB.QueryRow(`
+		SELECT id, identification_data
+		FROM person_event 
+		WHERE id = $1
+	`, state.TempData["person_event_id"]).Scan(&personEventID, &identificationData)
+
+	var participants []map[string]interface{}
+	if len(identificationData) > 0 {
+		json.Unmarshal(identificationData, &participants)
+	}
+
+	// Сортируем индексы для удаления с конца
+	sort.Ints(selected)
+
+	// Удаляем выбранных участников
+	newParticipants := []map[string]interface{}{}
+	removedNames := []string{}
+
+	for i, p := range participants {
+		shouldRemove := false
+		for _, idx := range selected {
+			if idx == i {
+				shouldRemove = true
+				if name, ok := p["full_name"].(string); ok {
+					removedNames = append(removedNames, name)
+				}
+				break
+			}
+		}
+		if !shouldRemove {
+			newParticipants = append(newParticipants, p)
+		}
+	}
+
+	// Обновляем данные в БД
+	newCount := len(newParticipants)
+	newData, _ := json.Marshal(newParticipants)
+
+	if newCount == 0 {
+		// Если никого не осталось - полностью отменяем запись
+		h.cancelRegistration(chatID, eventID, userID)
+		delete(h.UserStates, userID)
+		return
+	}
+
+	// Обновляем запись
+	_, err := database.DB.Exec(`
+		UPDATE person_event 
+		SET participants_count = $1,
+		    identification_data = $2
+		WHERE id = $3
+	`, newCount, newData, personEventID)
+
+	if err != nil {
+		log.Printf("❌ Ошибка обновления записи: %v", err)
+		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка при отмене"))
+		return
+	}
+
+	// Уведомление об успехе
+	successMsg := fmt.Sprintf("✅ Отменены участники:\n")
+	for _, name := range removedNames {
+		successMsg += fmt.Sprintf("• %s\n", name)
+	}
+	h.Bot.Send(tgbotapi.NewMessage(chatID, successMsg))
+
+	// Показываем обновленные детали
+	delete(h.UserStates, userID)
+	h.showEventDetails(chatID, eventID, userID)
 }

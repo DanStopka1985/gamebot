@@ -106,31 +106,6 @@ func (h *CallbackHandler) HandleCallback(callback *tgbotapi.CallbackQuery) {
 		return
 	}
 
-	// Проверяем специальные команды для дозаписи
-	switch data[0] {
-	case "add_more_count":
-		h.handleAddMoreCount(callback, data)
-		return
-	case "add_more_custom":
-		if len(data) < 2 {
-			return
-		}
-		eventID, _ := strconv.Atoi(data[1])
-		h.askCustomAddMore(chatID, eventID, userID)
-		return
-	case "select_additional", "select_additional_keep":
-		h.handleAdditionalSelection(callback, data)
-		return
-	case "remove_participant":
-		if len(data) < 3 {
-			return
-		}
-		eventID, _ := strconv.Atoi(data[1])
-		participantIndex, _ := strconv.Atoi(data[2])
-		h.removeParticipant(chatID, eventID, userID, participantIndex)
-		return
-	}
-
 	// Проверяем, не является ли это админским callback'ом
 	if data[0] == "admin" {
 		if h.isAdmin(userID) {
@@ -141,7 +116,7 @@ func (h *CallbackHandler) HandleCallback(callback *tgbotapi.CallbackQuery) {
 		return
 	}
 
-	// Проверяем специальные команды админки
+	// Проверяем специальные команды, которые могут приходить без префикса admin
 	switch data[0] {
 	case "players_page":
 		if len(data) < 3 {
@@ -173,13 +148,6 @@ func (h *CallbackHandler) HandleCallback(callback *tgbotapi.CallbackQuery) {
 		log.Printf("📝 Запрос регистрации на событие %d от пользователя %d", eventID, userID)
 		h.askParticipantsCount(chatID, eventID, userID)
 
-	case "add_more":
-		if len(data) < 2 {
-			return
-		}
-		eventID, _ := strconv.Atoi(data[1])
-		h.askAdditionalParticipants(chatID, eventID, userID)
-
 	case "confirm_reg":
 		if len(data) < 2 {
 			h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка формата данных"))
@@ -194,7 +162,11 @@ func (h *CallbackHandler) HandleCallback(callback *tgbotapi.CallbackQuery) {
 		count, _ := strconv.Atoi(parts[1])
 		log.Printf("✅ Подтверждение регистрации: событие %d, количество %d", eventID, count)
 
-		h.askParticipantNames(chatID, eventID, userID, count)
+		if count == 1 {
+			h.askParticipantNames(chatID, eventID, userID, count)
+		} else {
+			h.askParticipantNames(chatID, eventID, userID, count)
+		}
 
 	case "confirm_reg_with_identification":
 		if len(data) < 2 {
@@ -214,29 +186,44 @@ func (h *CallbackHandler) HandleCallback(callback *tgbotapi.CallbackQuery) {
 		h.registerForEventWithIdentification(chatID, eventID, userID, count, identified)
 		delete(h.UserStates, userID)
 
-	case "confirm_add_more":
-		if len(data) < 2 {
-			h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка формата данных"))
-			return
-		}
-		eventID, _ := strconv.Atoi(data[1])
-
-		state, exists := h.UserStates[userID]
-		if !exists || state.TempData["additional_players"] == nil {
-			h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка: данные не найдены. Начните заново."))
-			return
-		}
-
-		additional := state.TempData["additional_players"].([]map[string]interface{})
-		h.addMoreParticipants(chatID, eventID, userID, additional)
-		delete(h.UserStates, userID)
-
 	case "custom_count":
 		if len(data) < 2 {
 			return
 		}
 		eventID, _ := strconv.Atoi(data[1])
 		h.askCustomCount(chatID, eventID, userID)
+
+	// НОВЫЕ: Обработка отмены с выбором участников
+	case "cancel_choose":
+		if len(data) < 2 {
+			return
+		}
+		eventID, _ := strconv.Atoi(data[1])
+		h.askCancelParticipants(chatID, eventID, userID)
+		return
+
+	case "cancel_select":
+		if len(data) < 3 {
+			return
+		}
+		h.handleCancelSelection(callback, data)
+		return
+
+	case "cancel_selected":
+		if len(data) < 2 {
+			return
+		}
+		eventID, _ := strconv.Atoi(data[1])
+		h.cancelSelectedParticipants(chatID, eventID, userID)
+		return
+
+	case "cancel_all":
+		if len(data) < 2 {
+			return
+		}
+		eventID, _ := strconv.Atoi(data[1])
+		h.cancelRegistration(chatID, eventID, userID)
+		return
 
 	case "cancel_reg":
 		if len(data) < 2 {
@@ -256,12 +243,34 @@ func (h *CallbackHandler) HandleCallback(callback *tgbotapi.CallbackQuery) {
 		eventID, _ := strconv.Atoi(data[1])
 		h.showEventDetails(chatID, eventID, userID)
 
-	case "view_participants":
+	case "add_more":
 		if len(data) < 2 {
 			return
 		}
 		eventID, _ := strconv.Atoi(data[1])
-		h.showEventParticipants(chatID, eventID)
+		h.askAdditionalParticipants(chatID, eventID, userID)
+
+	case "add_more_count":
+		if len(data) < 3 {
+			return
+		}
+		h.handleAddMoreCount(callback, data)
+
+	case "add_more_custom":
+		if len(data) < 2 {
+			return
+		}
+		eventID, _ := strconv.Atoi(data[1])
+		h.askCustomAddMore(chatID, eventID, userID)
+
+	case "cancel_participant":
+		if len(data) < 3 {
+			return
+		}
+		eventID, _ := strconv.Atoi(data[1])
+		index, _ := strconv.Atoi(data[2])
+		h.cancelParticipant(chatID, eventID, userID, index)
+		return
 
 	default:
 		log.Printf("❌ Неизвестная команда: %s", data[0])
