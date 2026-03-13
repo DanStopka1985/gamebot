@@ -494,6 +494,8 @@ func (h *CallbackHandler) cancelRegistration(chatID int64, eventID int, userID i
 
 // showEventDetails показывает детали события
 func (h *CallbackHandler) showEventDetails(chatID int64, eventID int, userID int64) {
+	log.Printf("🔍 showEventDetails: событие %d, пользователь %d", eventID, userID)
+
 	var e models.Event
 	err := database.DB.QueryRow(`
 		SELECT e.id, c.name, e.evn_datetime, e.member_limit,
@@ -504,37 +506,44 @@ func (h *CallbackHandler) showEventDetails(chatID int64, eventID int, userID int
 	`, eventID).Scan(&e.ID, &e.CategoryName, &e.DateTime, &e.MemberLimit, &e.Registered)
 
 	if err != nil {
+		log.Printf("❌ Ошибка загрузки события: %v", err)
 		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Событие не найдено"))
 		return
 	}
 
 	// Проверяем, есть ли у пользователя запись на это событие
 	var dbPersonID int
-	database.DB.QueryRow(`SELECT id FROM person WHERE telegram_id = $1`, userID).Scan(&dbPersonID)
+	err = database.DB.QueryRow(`SELECT id FROM person WHERE telegram_id = $1`, userID).Scan(&dbPersonID)
+	if err != nil {
+		log.Printf("❌ Ошибка получения person ID: %v", err)
+	}
 
 	var existingID int
 	var registrationStatus string
 	var participantsCount int
-	var paymentStatus string
+	var userIdentificationData []byte
 
 	err = database.DB.QueryRow(`
-		SELECT id, status, participants_count, COALESCE(payment_status, 'pending')
+		SELECT id, status, participants_count, identification_data
 		FROM person_event 
 		WHERE person_id = $1 AND event_id = $2
-	`, dbPersonID, eventID).Scan(&existingID, &registrationStatus, &participantsCount, &paymentStatus)
+	`, dbPersonID, eventID).Scan(&existingID, &registrationStatus, &participantsCount, &userIdentificationData)
 
 	isRegistered := (err == nil && registrationStatus == "registered")
 	isAdmin := h.isAdmin(userID)
+
+	log.Printf("📊 isRegistered: %v, isAdmin: %v, existingID: %d", isRegistered, isAdmin, existingID)
 
 	// Получаем ВСЕХ участников события из всех записей
 	rows, err := database.DB.Query(`
 		SELECT 
 			pe.id as person_event_id,
+			p.id as person_id,
 			p.nikname,
 			p.firstname,
 			p.lastname,
 			pe.identification_data,
-			pe.payment_status
+			pe.participants_count
 		FROM person_event pe
 		JOIN person p ON pe.person_id = p.id
 		WHERE pe.event_id = $1 AND pe.status = 'registered'
@@ -543,9 +552,10 @@ func (h *CallbackHandler) showEventDetails(chatID int64, eventID int, userID int
 
 	if err != nil {
 		log.Printf("❌ Ошибка загрузки участников: %v", err)
-	} else {
-		defer rows.Close()
+		h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка загрузки данных"))
+		return
 	}
+	defer rows.Close()
 
 	// Формируем заголовок
 	text := fmt.Sprintf(
@@ -561,12 +571,27 @@ func (h *CallbackHandler) showEventDetails(chatID int64, eventID int, userID int
 	)
 
 	// Если у пользователя есть запись, показываем его статус
-	if isRegistered {
-		paymentEmoji := "⏳"
-		if paymentStatus == "paid" {
-			paymentEmoji = "💰"
+	if isRegistered && len(userIdentificationData) > 0 {
+		// Подсчитываем оплаченных участников в своей записи
+		var userIdentified []map[string]interface{}
+		if err := json.Unmarshal(userIdentificationData, &userIdentified); err == nil {
+			paidInUserRecord := 0
+			for _, p := range userIdentified {
+				if status, ok := p["payment_status"].(string); ok && status == "paid" {
+					paidInUserRecord++
+				}
+			}
+
+			paymentEmoji := "⏳"
+			if paidInUserRecord == participantsCount {
+				paymentEmoji = "💰"
+			} else if paidInUserRecord > 0 {
+				paymentEmoji = "⚠️"
+			}
+			text += fmt.Sprintf("%s *Ваша запись:* %d чел. (оплачено %d)\n", paymentEmoji, participantsCount, paidInUserRecord)
 		}
-		text += fmt.Sprintf("%s *Ваша запись:* %d чел.\n", paymentEmoji, participantsCount)
+	} else if isRegistered {
+		text += fmt.Sprintf("⏳ *Ваша запись:* %d чел.\n", participantsCount)
 	}
 
 	// Показываем ВСЕХ участников по группам (кто записал)
@@ -575,11 +600,12 @@ func (h *CallbackHandler) showEventDetails(chatID int64, eventID int, userID int
 	participantIndex := 1
 	for rows.Next() {
 		var peID int
+		var personID int64
 		var nikname, firstname, lastname string
 		var identificationData []byte
-		var pePaymentStatus string
+		var peParticipantsCount int
 
-		err := rows.Scan(&peID, &nikname, &firstname, &lastname, &identificationData, &pePaymentStatus)
+		err := rows.Scan(&peID, &personID, &nikname, &firstname, &lastname, &identificationData, &peParticipantsCount)
 		if err != nil {
 			log.Printf("❌ Ошибка сканирования: %v", err)
 			continue
@@ -597,40 +623,53 @@ func (h *CallbackHandler) showEventDetails(chatID int64, eventID int, userID int
 			registrantName += firstname + " " + lastname
 		}
 		if registrantName == "" {
-			registrantName = fmt.Sprintf("ID: %d", peID)
+			registrantName = fmt.Sprintf("ID: %d", personID)
 		}
 
+		log.Printf("📝 Обработка записи peID=%d от %s", peID, registrantName)
 		text += fmt.Sprintf("👤 *Записал:* %s\n", registrantName)
 
 		// Получаем участников из identification_data
 		if len(identificationData) > 0 {
 			var identified []map[string]interface{}
-			if err := json.Unmarshal(identificationData, &identified); err == nil {
-				for _, participant := range identified {
-					// Иконка идентификации
-					idIcon := "⚠️"
-					if pid, ok := participant["player_id"].(float64); ok && pid > 0 {
-						idIcon = "✅"
-					}
-
-					// Иконка оплаты
-					payIcon := "⏳"
-					if pePaymentStatus == "paid" {
-						payIcon = "💰"
-					}
-
-					fullName := "Неизвестно"
-					if fn, ok := participant["full_name"].(string); ok {
-						fullName = fn
-					}
-
-					text += fmt.Sprintf("  %d. %s %s %s\n", participantIndex, idIcon, payIcon, fullName)
-					participantIndex++
-				}
+			if err := json.Unmarshal(identificationData, &identified); err != nil {
+				log.Printf("❌ Ошибка парсинга identification_data: %v", err)
+				continue
 			}
+
+			log.Printf("📊 Найдено %d участников в записи %d", len(identified), peID)
+
+			for _, participant := range identified {
+				// Иконка идентификации
+				idIcon := "⚠️"
+				if pid, ok := participant["player_id"].(float64); ok && pid > 0 {
+					idIcon = "✅"
+				}
+
+				// Получаем имя участника
+				fullName := "Неизвестно"
+				if fn, ok := participant["full_name"].(string); ok && fn != "" {
+					fullName = fn
+				} else if input, ok := participant["input"].(string); ok && input != "" {
+					fullName = input
+				}
+
+				// Получаем статус оплаты из participant
+				payIcon := "⏳"
+				if pStatus, ok := participant["payment_status"].(string); ok && pStatus == "paid" {
+					payIcon = "💰"
+				}
+
+				text += fmt.Sprintf("  %d. %s %s %s\n", participantIndex, idIcon, payIcon, fullName)
+				participantIndex++
+			}
+		} else {
+			log.Printf("⚠️ Нет identification_data для записи %d", peID)
 		}
 		text += "\n"
 	}
+
+	log.Printf("📊 Всего участников отображено: %d", participantIndex-1)
 
 	var keyboard tgbotapi.InlineKeyboardMarkup
 
@@ -681,4 +720,6 @@ func (h *CallbackHandler) showEventDetails(chatID int64, eventID int, userID int
 	msg.ParseMode = "Markdown"
 	msg.ReplyMarkup = keyboard
 	h.Bot.Send(msg)
+
+	log.Printf("✅ showEventDetails завершена для события %d", eventID)
 }
