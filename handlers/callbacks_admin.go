@@ -265,6 +265,52 @@ func (h *CallbackHandler) handleAdminCallback(callback *tgbotapi.CallbackQuery, 
 		msgHandler := NewMessageHandler(h.Bot, h.AdminIDs, h.UserStates)
 		msgHandler.showPaymentManagement(chatID)
 
+		// Добавить в handleAdminCallback новый case:
+	case "set_event_type":
+		if len(data) < 3 {
+			return
+		}
+		eventType := data[2]
+
+		// Сохраняем тип события в состоянии
+		h.UserStates[userID] = &models.UserState{
+			Action:    "add_event",
+			EventType: eventType,
+			Step:      "awaiting_category",
+			TempData:  make(map[string]interface{}),
+		}
+
+		// Показываем список категорий
+		rows, err := database.DB.Query(`SELECT id, name FROM category ORDER BY name`)
+		if err != nil {
+			log.Printf("❌ Ошибка загрузки категорий: %v", err)
+			h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка загрузки категорий"))
+			delete(h.UserStates, userID)
+			return
+		}
+		defer rows.Close()
+
+		var buttons [][]tgbotapi.InlineKeyboardButton
+		for rows.Next() {
+			var id int
+			var name string
+			rows.Scan(&id, &name)
+			buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData(name, fmt.Sprintf("admin:add_category:%d", id)),
+			))
+		}
+
+		if len(buttons) == 0 {
+			h.Bot.Send(tgbotapi.NewMessage(chatID, "❌ Нет доступных категорий. Сначала создайте категорию."))
+			delete(h.UserStates, userID)
+			return
+		}
+
+		keyboard := tgbotapi.NewInlineKeyboardMarkup(buttons...)
+		msg := tgbotapi.NewMessage(chatID, "Выберите категорию:")
+		msg.ReplyMarkup = keyboard
+		h.Bot.Send(msg)
+
 	case "back":
 		delete(h.UserStates, userID)
 		msg := tgbotapi.NewMessage(chatID, "👑 Панель администратора:")

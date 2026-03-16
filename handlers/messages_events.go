@@ -23,31 +23,15 @@ func (h *MessageHandler) startAddEvent(message *tgbotapi.Message) {
 
 	log.Printf("➕ Начало создания события администратором %d", message.From.ID)
 
-	rows, err := database.DB.Query(`SELECT id, name FROM category ORDER BY name`)
-	if err != nil {
-		log.Printf("❌ Ошибка загрузки категорий: %v", err)
-		h.Bot.Send(tgbotapi.NewMessage(message.Chat.ID, "❌ Ошибка загрузки категорий"))
-		return
-	}
-	defer rows.Close()
+	// Сначала спрашиваем тип события
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🎮 Обычное", "admin:set_event_type:regular"),
+			tgbotapi.NewInlineKeyboardButtonData("🔄 Опциональное", "admin:set_event_type:flexible"),
+		),
+	)
 
-	var buttons [][]tgbotapi.InlineKeyboardButton
-	for rows.Next() {
-		var id int
-		var name string
-		rows.Scan(&id, &name)
-		buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData(name, fmt.Sprintf("admin:add_category:%d", id)),
-		))
-	}
-
-	if len(buttons) == 0 {
-		h.Bot.Send(tgbotapi.NewMessage(message.Chat.ID, "❌ Нет доступных категорий. Сначала создайте категорию."))
-		return
-	}
-
-	keyboard := tgbotapi.NewInlineKeyboardMarkup(buttons...)
-	msg := tgbotapi.NewMessage(message.Chat.ID, "Выберите категорию:")
+	msg := tgbotapi.NewMessage(message.Chat.ID, "Выберите тип события:")
 	msg.ReplyMarkup = keyboard
 	h.Bot.Send(msg)
 }
@@ -158,13 +142,17 @@ func (h *MessageHandler) confirmAddEvent(chatID int64, userID int64) {
 		return
 	}
 
-	// datetime уже в UTC, сохраняем как есть
+	eventType := "regular"
+	if state.EventType != "" {
+		eventType = state.EventType
+	}
+
 	var eventID int
 	err := database.DB.QueryRow(`
-		INSERT INTO event (category_id, evn_datetime, member_limit)
-		VALUES ($1, $2, $3)
+		INSERT INTO event (category_id, evn_datetime, member_limit, event_type)
+		VALUES ($1, $2, $3, $4)
 		RETURNING id
-	`, state.CategoryID, datetime, limit).Scan(&eventID)
+	`, state.CategoryID, datetime, limit, eventType).Scan(&eventID)
 
 	if err != nil {
 		log.Printf("❌ Ошибка создания события: %v", err)
@@ -177,15 +165,17 @@ func (h *MessageHandler) confirmAddEvent(chatID int64, userID int64) {
 	database.DB.QueryRow(`SELECT name FROM category WHERE id = $1`, state.CategoryID).Scan(&categoryName)
 
 	// Для отображения конвертируем обратно в локальный часовой пояс
-	loc, err := time.LoadLocation("Europe/Moscow")
-	if err != nil {
-		loc = time.FixedZone("UTC+3", 3*60*60)
-	}
+	loc, _ := time.LoadLocation("Europe/Moscow")
 	localTime := datetime.In(loc)
 
+	typeText := "🎮 Обычное"
+	if eventType == "flexible" {
+		typeText = "🔄 Опциональное (новички/общая)"
+	}
+
 	h.Bot.Send(tgbotapi.NewMessage(chatID,
-		fmt.Sprintf("✅ Событие '%s' на %s успешно создано! ID: #%d",
-			categoryName, localTime.Format("02.01.2006 15:04"), eventID)))
+		fmt.Sprintf("✅ Событие '%s' на %s успешно создано! ID: #%d\n%s",
+			categoryName, localTime.Format("02.01.2006 15:04"), eventID, typeText)))
 
 	delete(h.UserStates, userID)
 }
@@ -199,7 +189,7 @@ func (h *MessageHandler) showAllEvents(chatID int64) {
 	log.Printf("👑 Запрос всех событий от администратора %d", chatID)
 
 	rows, err := database.DB.Query(`
-		SELECT e.id, c.name, e.evn_datetime, e.member_limit,
+		SELECT e.id, c.name, e.evn_datetime, e.member_limit, COALESCE(e.event_type, 'regular'),
 		       COALESCE((SELECT SUM(participants_count) FROM person_event WHERE event_id = e.id AND status = 'registered'), 0)
 		FROM event e
 		JOIN category c ON e.category_id = c.id
@@ -214,22 +204,41 @@ func (h *MessageHandler) showAllEvents(chatID int64) {
 	}
 	defer rows.Close()
 
+	// Конвертируем время в локальный часовой пояс (Москва, UTC+3)
+	loc, err := time.LoadLocation("Europe/Moscow")
+	if err != nil {
+		loc = time.FixedZone("UTC+3", 3*60*60)
+	}
+
 	count := 0
 	for rows.Next() {
 		count++
 		var e models.Event
-		err := rows.Scan(&e.ID, &e.CategoryName, &e.DateTime, &e.MemberLimit, &e.Registered)
+		err := rows.Scan(&e.ID, &e.CategoryName, &e.DateTime, &e.MemberLimit, &e.EventType, &e.Registered)
 		if err != nil {
 			log.Printf("❌ Ошибка сканирования: %v", err)
 			continue
 		}
 
+		localDateTime := e.DateTime.In(loc)
+
+		// Определяем иконку типа
+		typeIcon := "🎮"
+		if e.EventType == "flexible" {
+			typeIcon = "🔄"
+		}
+
 		text := fmt.Sprintf(
-			"🆔 *%d* | %s\n📆 %s\n👥 %d/%d\n",
-			e.ID, e.CategoryName,
-			e.DateTime.Format("02.01.2006 15:04"),
+			"%s *%d* | %s\n📆 %s\n👥 %d/%d\n",
+			typeIcon, e.ID, e.CategoryName,
+			localDateTime.Format("02.01.2006 15:04"),
 			e.Registered, e.MemberLimit,
 		)
+
+		// Добавляем пояснение для опциональных событий
+		if e.EventType == "flexible" {
+			text += "🔄 *Опциональное* (новички/общая)\n"
+		}
 
 		keyboard := tgbotapi.NewInlineKeyboardMarkup(
 			tgbotapi.NewInlineKeyboardRow(

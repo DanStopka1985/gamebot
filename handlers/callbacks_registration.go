@@ -546,12 +546,12 @@ func (h *CallbackHandler) showEventDetails(chatID int64, eventID int, userID int
 
 	var e models.Event
 	err := database.DB.QueryRow(`
-		SELECT e.id, c.name, e.evn_datetime, e.member_limit,
+		SELECT e.id, c.name, e.evn_datetime, e.member_limit, COALESCE(e.event_type, 'regular'),
 		       COALESCE((SELECT SUM(participants_count) FROM person_event WHERE event_id = e.id AND status = 'registered'), 0)
 		FROM event e
 		JOIN category c ON e.category_id = c.id
 		WHERE e.id = $1
-	`, eventID).Scan(&e.ID, &e.CategoryName, &e.DateTime, &e.MemberLimit, &e.Registered)
+	`, eventID).Scan(&e.ID, &e.CategoryName, &e.DateTime, &e.MemberLimit, &e.EventType, &e.Registered)
 
 	if err != nil {
 		log.Printf("❌ Ошибка загрузки события: %v", err)
@@ -614,13 +614,21 @@ func (h *CallbackHandler) showEventDetails(chatID int64, eventID int, userID int
 
 	localDateTime := e.DateTime.In(loc)
 
+	// Определяем иконку и текст для типа события
+	typeIcon := "🎮"
+	typeText := ""
+	if e.EventType == "flexible" {
+		typeIcon = "🔄"
+		typeText = "\n🔄 *Опциональное* (новички/общая - выбирает первый записавшийся)"
+	}
+
 	// Формируем заголовок
 	text := fmt.Sprintf(
-		"📅 *%s*\n\n"+
+		"%s *%s*%s\n\n"+
 			"📆 Дата: %s\n"+
 			"👥 Всего записано: %d/%d\n"+
 			"📊 Свободно: %d\n\n",
-		e.CategoryName,
+		typeIcon, e.CategoryName, typeText,
 		localDateTime.Format("02.01.2006 15:04"),
 		e.Registered,
 		e.MemberLimit,
@@ -759,6 +767,15 @@ func (h *CallbackHandler) showEventDetails(chatID int64, eventID int, userID int
 			{
 				tgbotapi.NewInlineKeyboardButtonData("✅ Записаться", fmt.Sprintf("register:%d", eventID)),
 			},
+		}
+
+		// Для опциональных событий и если это первый записавшийся
+		if e.EventType == "flexible" && e.Registered == 0 {
+			// Добавляем кнопки выбора формата
+			buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("👥 Общая игра", fmt.Sprintf("set_game_type:regular:%d", eventID)),
+				tgbotapi.NewInlineKeyboardButtonData("🆕 Для новичков", fmt.Sprintf("set_game_type:novice:%d", eventID)),
+			))
 		}
 
 		// Для админов даже без записи можно добавить кнопку оплаты

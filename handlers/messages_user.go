@@ -93,15 +93,24 @@ func (h *MessageHandler) handleListEvents(message *tgbotapi.Message) {
 
 // showEventPreview показывает предпросмотр события
 func (h *MessageHandler) showEventPreview(chatID int64, e models.Event) {
+	typeIcon := "🎮"
+	if e.EventType == "flexible" {
+		typeIcon = "🔄"
+	}
+
 	text := fmt.Sprintf(
-		"📅 *%s*\n"+
+		"%s *%s*\n"+
 			"📆 %s\n"+
 			"👥 Записано: %d/%d\n",
-		e.CategoryName,
+		typeIcon, e.CategoryName,
 		e.DateTime.Format("02.01.2006 15:04"),
 		e.Registered,
 		e.MemberLimit,
 	)
+
+	if e.EventType == "flexible" {
+		text += "🔄 *Опциональное* (новички/общая - выбирает первый записавшийся)\n"
+	}
 
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(

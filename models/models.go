@@ -3,6 +3,7 @@ package models
 import "time"
 
 // Event структура для события
+// Event структура для события
 type Event struct {
 	ID           int
 	CategoryID   int
@@ -10,6 +11,7 @@ type Event struct {
 	DateTime     time.Time
 	MemberLimit  int
 	Registered   int
+	EventType    string // regular или flexible
 }
 
 // Person структура для пользователя
@@ -36,6 +38,7 @@ type PersonEvent struct {
 type UserState struct {
 	Action     string
 	CategoryID int
+	EventType  string // regular или flexible
 	Step       string
 	TempData   map[string]interface{}
 }

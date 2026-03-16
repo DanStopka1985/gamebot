@@ -75,9 +75,11 @@ func main() {
 	}
 	defer database.CloseDB()
 
+	// Загружаем администраторов канала (вместо жестко прописанных)
 	// Загружаем администраторов канала
 	updateAdminList()
 
+	// Создаем обработчики - передаем указатель на adminIDs
 	// Создаем обработчики
 	channelHandler := handlers.NewChannelHandler(bot)
 	msgHandler := handlers.NewMessageHandler(bot, &adminIDs, userStates)
@@ -88,10 +90,6 @@ func main() {
 	log.Printf("   - ChannelHandler: %v", channelHandler != nil)
 	log.Printf("   - MessageHandler: %v", msgHandler != nil)
 	log.Printf("   - CallbackHandler: %v", callbackHandler != nil)
-
-	// Запускаем горутину для проверки напоминаний
-	go callbackHandler.StartReminderChecker()
-	log.Println("🔔 Проверка напоминаний запущена")
 
 	// Проверка и удаление webhook если есть
 	log.Println("🔄 Проверка наличия webhook...")
@@ -112,6 +110,7 @@ func main() {
 	}
 
 	// Настройка обновлений с правильными параметрами
+	// Настройка обновлений
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 	u.AllowedUpdates = []string{"message", "callback_query", "channel_post", "my_chat_member", "chat_member"}
