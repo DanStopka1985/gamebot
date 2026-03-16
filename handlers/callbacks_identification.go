@@ -104,7 +104,94 @@ func (h *CallbackHandler) identifyNextPlayer(chatID int64, userID int64, index i
 	input := inputs[index]
 	state.TempData["current_index"] = index
 
-	// Ищем игрока
+	// Проверяем специальные ключевые слова (я, себя, меня)
+	inputLower := strings.ToLower(strings.TrimSpace(input))
+	if inputLower == "я" || inputLower == "себя" || inputLower == "меня" {
+		log.Printf("👤 Обнаружено ключевое слово '%s' - добавляем текущего пользователя", input)
+
+		// Получаем данные пользователя из таблицы person
+		var dbPersonID int
+		var nikname, firstname, lastname string
+		err := database.DB.QueryRow(`
+			SELECT id, nikname, firstname, lastname FROM person WHERE telegram_id = $1
+		`, userID).Scan(&dbPersonID, &nikname, &firstname, &lastname)
+
+		if err != nil {
+			log.Printf("❌ Ошибка получения данных пользователя: %v", err)
+			// Если не удалось получить, создаем базовую информацию
+			nikname = fmt.Sprintf("user_%d", userID)
+			firstname = "Пользователь"
+		}
+
+		// Пытаемся найти player_id в таблице players
+		var playerID int
+		var playerFullName string
+		var playerTelegramNick string
+
+		// Ищем по никнейму
+		if nikname != "" {
+			err = database.DB.QueryRow(`
+				SELECT id, full_name, telegram_nick FROM players 
+				WHERE telegram_nick = $1 OR telegram_nick = '@' || $1
+			`, nikname).Scan(&playerID, &playerFullName, &playerTelegramNick)
+		}
+
+		// Если не нашли, ищем по имени
+		if err != nil && firstname != "" {
+			// Убрали неиспользуемую переменную searchName
+			err = database.DB.QueryRow(`
+				SELECT id, full_name, telegram_nick FROM players 
+				WHERE full_name ILIKE $1
+			`, "%"+firstname+"%").Scan(&playerID, &playerFullName, &playerTelegramNick)
+		}
+
+		fullName := fmt.Sprintf("%s %s", firstname, lastname)
+		if strings.TrimSpace(fullName) == "" {
+			if nikname != "" {
+				fullName = nikname
+			} else {
+				fullName = "Пользователь"
+			}
+		}
+
+		telegramUsername := ""
+		if nikname != "" {
+			telegramUsername = "@" + nikname
+		}
+
+		// Сохраняем идентифицированного игрока
+		identified := state.TempData["identified_players"].([]map[string]interface{})
+
+		if playerID > 0 {
+			// Нашли в базе players
+			identified = append(identified, map[string]interface{}{
+				"player_id":     playerID,
+				"input":         input,
+				"full_name":     playerFullName,
+				"telegram_nick": playerTelegramNick,
+				"method":        "self_identified",
+			})
+			log.Printf("✅ Пользователь найден в players: ID=%d, имя=%s", playerID, playerFullName)
+		} else {
+			// Не нашли в базе
+			identified = append(identified, map[string]interface{}{
+				"player_id":     0,
+				"input":         input,
+				"full_name":     fullName,
+				"telegram_nick": telegramUsername,
+				"method":        "self",
+			})
+			log.Printf("⚠️ Пользователь не найден в players, добавляем как '%s'", fullName)
+		}
+
+		state.TempData["identified_players"] = identified
+
+		// Переходим к следующему
+		h.identifyNextPlayer(chatID, userID, index+1)
+		return
+	}
+
+	// Ищем игрока в базе players
 	results, err := utils.FindPlayer(database.DB, input)
 	if err != nil {
 		log.Printf("❌ Ошибка поиска игрока: %v", err)
@@ -128,7 +215,6 @@ func (h *CallbackHandler) identifyNextPlayer(chatID int64, userID int64, index i
 		)
 
 		msgObj := tgbotapi.NewMessage(chatID, msg)
-		// Убираем Markdown разметку для этого сообщения
 		msgObj.ParseMode = ""
 		msgObj.ReplyMarkup = keyboard
 		h.Bot.Send(msgObj)
@@ -141,7 +227,6 @@ func (h *CallbackHandler) identifyNextPlayer(chatID int64, userID int64, index i
 		// Найден один игрок - показываем для подтверждения
 		r := results[0]
 
-		// Экранируем специальные символы для Markdown
 		fullName := escapeMarkdown(r.FullName)
 		inputEscaped := escapeMarkdown(input)
 
